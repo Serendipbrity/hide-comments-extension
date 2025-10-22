@@ -1,0 +1,9 @@
+/* Target lines that ONLY contain TextEditorDecorationType (no actual tokens) */
+.view-line:not(:has(.mtk1)):not(:has(.mtk2)):not(:has(.mtk3)):not(:has(.mtk4)):not(:has(.mtk5)):not(:has(.mtk6)):not(:has(.mtk7)):not(:has(.mtk8)):not(:has(.mtk9)):not(:has(.mtk10)):not(:has(.mtk11)):not(:has(.mtk12)):not(:has(.mtk13)):not(:has(.mtk14)):not(:has(.mtk15)):not(:has(.mtk16)):not(:has(.mtk17)):not(:has(.mtk18)):not(:has(.mtk19)):not(:has(.mtk20)) {
+    display: none !important;
+    height: 0 !important;
+    line-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}

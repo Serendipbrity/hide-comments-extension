@@ -1,0 +1,32 @@
+{
+  "name": "hide-comments-extension",
+  "displayName": "Hide Comments Preview",
+  "version": "0.0.1",
+  "publisher": "Brittani Court",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "activationEvents": [
+    "onCommand:hideComments.previewToggle"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "hideComments.previewToggle",
+        "title": "Hide Comments: Preview Toggle"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Hide Comments Settings",
+      "properties": {
+        "hideComments.autoSplitView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the Hide Comments view in a split editor on the right."
+        }
+      }
+    }
+  }
+}
