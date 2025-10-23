@@ -1,32 +1,53 @@
 {
-  "name": "hide-comments-extension",
-  "displayName": "Hide Comments Preview",
-  "version": "0.0.1",
+  "name": "vcm-extension",
+  "displayName": "VCM - Versioned Comment Manager",
+  "version": "0.1.0",
   "publisher": "Brittani Court",
+  "description": "Invisible documentation layer for code - keep repos clean, comments versioned",
   "engines": {
     "vscode": "^1.70.0"
   },
   "activationEvents": [
-    "onCommand:hideComments.previewToggle"
+    "onStartupFinished"
   ],
-  "main": "./extension.js",
+  "main": "./vcm-extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "hideComments.previewToggle",
-        "title": "Hide Comments: Preview Toggle"
+        "command": "vcm.toggleComments",
+        "title": "VCM: Toggle Comments View"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "vcm.toggleComments",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "editorTextFocus"
       }
     ],
     "configuration": {
       "type": "object",
-      "title": "Hide Comments Settings",
+      "title": "VCM Settings",
       "properties": {
-        "hideComments.autoSplitView": {
+        "vcm.autoSplitView": {
           "type": "boolean",
           "default": true,
-          "description": "Open the Hide Comments view in a split editor on the right."
+          "description": "Open the comments view in a split editor on the right"
+        },
+        "vcm.liveSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-save .vcm files while typing (2 second debounce)"
         }
       }
     }
-  }
+  },
+  "categories": ["Other"],
+  "keywords": ["comments", "documentation", "code-review", "clean-code"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/vcm-extension"
+  },
+  "license": "MIT"
 }
