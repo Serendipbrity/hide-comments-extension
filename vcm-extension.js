@@ -138,17 +138,17 @@ function injectComments(cleanText, comments) {
   return result.join("\n");
 }
 
-// Strip all comments from text
+// Strip all comments from text but keep indentation and spacing
 function stripComments(text) {
   return text
     .split("\n")
     .filter(line => {
       const trimmed = line.trim();
-      // Keep line if it's not a pure comment line
-      return trimmed && !/^(#|\/\/|--|%|;)/.test(trimmed);
+      // Keep blank lines OR lines that aren't pure comment lines
+      return !trimmed || !/^(#|\/\/|--|%|;)/.test(trimmed);
     })
     .map(line => {
-      // Remove inline comments
+      // Remove inline comments from code lines (anything after comment marker)
       return line.replace(/\s+(#|\/\/|--|%|;).*$/, '');
     })
     .join("\n");
