@@ -324,7 +324,6 @@ async function activate(context) {
     setTimeout(async () => {
       try {
         await vscode.commands.executeCommand("workbench.action.focusFirstEditorGroup");
-        await vscode.commands.executeCommand("workbench.action.pinEditor");
       } catch (e) {
         console.warn("VCM layout reset failed", e);
       }
