@@ -231,20 +231,89 @@ async function activate(context) {
     );
   }
 
-  // Watch for file saves to update .vcm mirrors
-  const saveWatcher = vscode.workspace.onDidSaveTextDocument(saveVCM);
+  /// Global live sync guard
+  let vcmSyncEnabled = true;
+
+  // Hook for manual save
+  const saveWatcher = vscode.workspace.onDidSaveTextDocument(async (doc) => {
+    if (!vcmSyncEnabled) return; // skip if toggling
+    await saveVCM(doc);
+  });
   context.subscriptions.push(saveWatcher);
 
-  // Optional: Live sync with debounce (if enabled in settings)
+  // Hook for live sync while typing (optional)
   const liveSync = config.get("liveSync", false);
   if (liveSync) {
     let writeTimeout;
-    const changeWatcher = vscode.workspace.onDidChangeTextDocument(e => {
+    const changeWatcher = vscode.workspace.onDidChangeTextDocument((e) => {
+      if (!vcmSyncEnabled) return; // skip if toggling
       clearTimeout(writeTimeout);
       writeTimeout = setTimeout(() => saveVCM(e.document), 2000);
     });
     context.subscriptions.push(changeWatcher);
   }
+
+  function handleLiveSync(e) {
+    if (!liveSyncEnabled) return; // Skip if disabled
+    clearTimeout(writeTimeout);
+    writeTimeout = setTimeout(() => saveVCM(e.document), 2000);
+  }
+
+  const changeWatcher = vscode.workspace.onDidChangeTextDocument(handleLiveSync);
+  context.subscriptions.push(changeWatcher);
+
+
+  // ------------------------------------------------------------
+  // Command: Toggle comments for current file (same file view)
+  // ------------------------------------------------------------
+  const toggleCurrentFileComments = vscode.commands.registerCommand("vcm.toggleCurrentFileComments", async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return;
+
+    // 🔒 Disable sync
+    vcmSyncEnabled = false;
+
+    const doc = editor.document;
+    const fileText = doc.getText();
+    const relativePath = vscode.workspace.asRelativePath(doc.uri);
+    const vcmDir = vscode.Uri.joinPath(
+      vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(process.cwd()),
+      ".vcm"
+    );
+    const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+    const hasComments = /(^\s*(#|\/\/|--|%|;)|\s+(#|\/\/|--|%|;)).*/m.test(fileText);
+    let newText;
+
+    if (hasComments) {
+      newText = stripComments(fileText);
+      vscode.window.showInformationMessage("VCM: Comments hidden (clean view)");
+    } else {
+      try {
+        const vcmFile = await vscode.workspace.fs.readFile(vcmFileUri);
+        const vcmData = JSON.parse(vcmFile.toString());
+        newText = injectComments(fileText, vcmData.comments || []);
+        vscode.window.showInformationMessage("VCM: Comments restored from .vcm");
+      } catch (e) {
+        vscode.window.showErrorMessage("VCM: No .vcm data found — save once with comments first.");
+        vcmSyncEnabled = true; // re-enable before exit
+        return;
+      }
+    }
+
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
+    await vscode.workspace.applyEdit(edit);
+    await vscode.commands.executeCommand("workbench.action.files.save");
+
+    // 🔓 Re-enable sync (delay ensures watchers don't fire mid-save)
+    setTimeout(() => {
+      vcmSyncEnabled = true;
+    }, 1000);
+  });
+
+
+
 
   // Main toggle command
   const disposable = vscode.commands.registerCommand("vcm.toggleComments", async () => {
