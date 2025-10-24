@@ -330,75 +330,67 @@ async function activate(context) {
     }, 150);
     
     // Setup symbol-based click-to-jump (bidirectional)
+    // Click-to-jump: clicking source jumps temp view to matching code
     const sourceEditor = editor;
     
     scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
       if (!vcmEditor) return;
       
-      let fromEditor, toEditor;
-      if (e.textEditor === sourceEditor) {
-        fromEditor = sourceEditor;
-        toEditor = vcmEditor;
-      } else if (e.textEditor === vcmEditor) {
-        fromEditor = vcmEditor;
-        toEditor = sourceEditor;
-      } else {
-        return;
-      }
+      // Only jump when clicking in the SOURCE editor
+      if (e.textEditor !== sourceEditor) return;
       
       const cursorPos = e.selections[0].active;
-      const wordRange = fromEditor.document.getWordRangeAtPosition(cursorPos);
+      const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
       if (!wordRange) return;
       
-      const symbolAtCursor = fromEditor.document.getText(wordRange);
-      const targetText = toEditor.document.getText();
+      const symbolAtCursor = sourceEditor.document.getText(wordRange);
+      if (symbolAtCursor.length < 2) return;
       
-      // Look for function/class definitions or the symbol itself
-      const patterns = [
-        new RegExp(`^\\s*def\\s+${symbolAtCursor}\\s*\\(`, 'm'),
-        new RegExp(`^\\s*class\\s+${symbolAtCursor}\\s*[:\\(]`, 'm'),
-        new RegExp(`^\\s*function\\s+${symbolAtCursor}\\s*\\(`, 'm'),
-        new RegExp(`^\\s*const\\s+${symbolAtCursor}\\s*=`, 'm'),
-        new RegExp(`\\b${symbolAtCursor}\\b`, 'm'),
+      const targetText = vcmEditor.document.getText();
+      const targetLines = targetText.split('\n');
+      
+      // Search for the symbol - prioritize definitions, then any occurrence
+      let targetLine = -1;
+      
+      // First pass: look for definitions
+      const defPatterns = [
+        new RegExp(`^\\s*def\\s+${symbolAtCursor}\\s*\\(`),
+        new RegExp(`^\\s*class\\s+${symbolAtCursor}\\s*[:\\(]`),
+        new RegExp(`^\\s*function\\s+${symbolAtCursor}\\s*\\(`),
+        new RegExp(`^\\s*const\\s+${symbolAtCursor}\\s*=`),
+        new RegExp(`^\\s*let\\s+${symbolAtCursor}\\s*=`),
+        new RegExp(`^\\s*var\\s+${symbolAtCursor}\\s*=`),
       ];
       
-      let targetLine = -1;
-      for (const pattern of patterns) {
-        const match = targetText.match(pattern);
-        if (match && match.index !== undefined) {
-          targetLine = targetText.substring(0, match.index).split("\n").length - 1;
-          break;
+      for (let i = 0; i < targetLines.length; i++) {
+        for (const pattern of defPatterns) {
+          if (pattern.test(targetLines[i])) {
+            targetLine = i;
+            break;
+          }
+        }
+        if (targetLine >= 0) break;
+      }
+      
+      // Second pass: if no definition found, find first occurrence
+      if (targetLine < 0) {
+        const symbolRegex = new RegExp(`\\b${symbolAtCursor}\\b`);
+        for (let i = 0; i < targetLines.length; i++) {
+          if (symbolRegex.test(targetLines[i])) {
+            targetLine = i;
+            break;
+          }
         }
       }
       
+      // Jump ONLY the temp view to the target line
       if (targetLine >= 0) {
         const targetPos = new vscode.Position(targetLine, 0);
-        toEditor.selection = new vscode.Selection(targetPos, targetPos);
-        
-        const fromVisibleRanges = fromEditor.visibleRanges;
-        if (fromVisibleRanges.length > 0) {
-          const fromTopLine = fromVisibleRanges[0].start.line;
-          const fromCursorLine = cursorPos.line;
-          const linesFromTop = fromCursorLine - fromTopLine;
-          const targetTopLine = Math.max(0, targetLine - linesFromTop);
-          
-          toEditor.revealRange(
-            new vscode.Range(targetTopLine, 0, targetLine + 10, 0),
-            vscode.TextEditorRevealType.Default
-          );
-          
-          setTimeout(() => {
-            toEditor.revealRange(
-              new vscode.Range(targetTopLine, 0, targetTopLine, 0),
-              vscode.TextEditorRevealType.AtTop
-            );
-          }, 10);
-        } else {
-          toEditor.revealRange(
-            new vscode.Range(targetPos, targetPos),
-            vscode.TextEditorRevealType.InCenter
-          );
-        }
+        vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
+        vcmEditor.revealRange(
+          new vscode.Range(targetPos, targetPos),
+          vscode.TextEditorRevealType.InCenter
+        );
       }
     });
     context.subscriptions.push(scrollListener);
