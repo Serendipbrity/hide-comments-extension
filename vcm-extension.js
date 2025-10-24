@@ -95,46 +95,42 @@ function extractComments(text, filePath) {
   return comments;
 }
 
-// Rebuild text with comments injected at anchors
+// Rebuild text with comments injected at anchors (anchorLine-based)
 function injectComments(cleanText, comments) {
   const lines = cleanText.split("\n");
   const result = [];
-  
-  // Pre-index comments by anchor for O(1) lookup
-  const blockMap = {};
-  const inlineMap = {};
-  
-  for (const c of comments) {
-    if (c.type === "block") {
-      blockMap[c.anchor] = c;
-    } else if (c.type === "inline") {
-      inlineMap[c.anchor] = c;
-    }
-  }
-  
+
+  // Separate block and inline for clarity
+  const blockComments = comments.filter(c => c.type === "block" || c.type === "orphan");
+  const inlineComments = comments.filter(c => c.type === "inline");
+
+  // Sort blocks by anchorLine to ensure order
+  blockComments.sort((a, b) => a.anchorLine - b.anchorLine);
+  inlineComments.sort((a, b) => a.anchorLine - b.anchorLine);
+
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const lineHash = hashLine(line, i);
-    
-    // Check for block comments anchored to this line
-    const blockComment = blockMap[lineHash];
-    if (blockComment) {
-      // Insert comment block above this line
-      for (const comment of blockComment.block) {
-        result.push(`${comment.indent}${comment.marker} ${comment.text}`);
+    // Before writing this line, check if there’s a block comment anchored here
+    const block = blockComments.filter(b => b.anchorLine === i);
+    if (block.length > 0) {
+      for (const b of block) {
+        for (const c of b.block) {
+          result.push(`${c.indent || ""}${c.marker || "//"} ${c.text}`);
+        }
       }
     }
-    
-    // Add the code line
-    const inlineComment = inlineMap[lineHash];
-    if (inlineComment) {
-      // Add inline comment to end of line
-      result.push(`${line}  ${inlineComment.marker} ${inlineComment.text}`);
-    } else {
-      result.push(line);
+
+    // Now the actual code line
+    let line = lines[i];
+
+    // Check for inline comment attached to this line
+    const inline = inlineComments.find(ic => ic.anchorLine === i);
+    if (inline) {
+      line += `  ${inline.marker || "//"} ${inline.text}`;
     }
+
+    result.push(line);
   }
-  
+
   return result.join("\n");
 }
 
