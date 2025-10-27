@@ -39,13 +39,13 @@ class VCMContentProvider {
   }
 }
 
-// Create a unique hash for each line of code
-// Used to track where comments belong even when line numbers change
-// Format: MD5(trimmed_line)
-// Example: "x = 5::42" -> "a3f2b1c4"
+// Create a unique hash for each line of code based ONLY on content
+// This makes the hash stable even when line numbers change
+// Format: MD5(trimmed_line) truncated to 8 chars
+// Example: "x = 5" -> "a3f2b1c4"
 function hashLine(line, lineIndex) {
   return crypto.createHash("md5")
-    .update(line.trim())
+    .update(line.trim())  // Only hash content, NOT line index
     .digest("hex")
     .substring(0, 8);
 }
@@ -63,65 +63,127 @@ function hashLine(line, lineIndex) {
 //
 // Key concept: Comments are "anchored" to the next line of code below them
 // This allows reconstruction even if line numbers change
-// Extract all comments and anchor them to the next real code line (by hash)
 function extractComments(text, filePath) {
   const lines = text.split("\n");
-  const comments = [];
-  let commentBuffer = [];
+  const comments = [];      // Final array of all extracted comments
+  let commentBuffer = [];   // Temporary buffer for consecutive comment lines
 
-  const isComment = (l) => l.trim().match(/^(#|\/\/|--|%|;)/);
+  // Detect language from file extension to use correct comment markers
+  const ext = filePath.split('.').pop().toLowerCase();
+  let commentMarkers;
+  
+  if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
+    commentMarkers = ['#'];  // Python only uses #
+  } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
+    commentMarkers = ['//'];  // C-style languages
+  } else if (['sql', 'lua'].includes(ext)) {
+    commentMarkers = ['--'];  // SQL/Lua style
+  } else if (['m', 'matlab'].includes(ext)) {
+    commentMarkers = ['%'];  // MATLAB style
+  } else if (['asm', 's'].includes(ext)) {
+    commentMarkers = [';'];  // Assembly style
+  } else {
+    commentMarkers = ['#', '//', '--', '%', ';'];  // Default: support all
+  }
 
+  // Build regex pattern for this file type
+  const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  
+  // Helper: Check if a line is a comment
+  const isComment = (l) => {
+    const trimmed = l.trim();
+    for (const marker of commentMarkers) {
+      if (trimmed.startsWith(marker)) return true;
+    }
+    return false;
+  };
+
+  // Process each line sequentially
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+    
+    // Skip blank lines - they don't affect comment grouping
     if (!trimmed) continue;
 
     // CASE 1: This line is a standalone comment
     if (isComment(line)) {
-      const match = line.match(/^(\s*)(#|\/\/|--|%|;)\s?(.*)$/);
+      // Extract comment parts: indent, marker, and text
+      const match = line.match(new RegExp(`^(\\s*)(${markerPattern})\\s?(.*?)$`));
       if (match) {
         commentBuffer.push({
-          text: match[3],
-          indent: match[1],
-          marker: match[2],
-          originalLine: i,
+          text: match[3],        // The actual comment text
+          indent: match[1],      // Whitespace before the comment marker
+          marker: match[2],      // The comment symbol
+          originalLine: i,       // 0-based line index
         });
       }
-      continue;
+      continue; // Move to next line, stay in comment-gathering mode
     }
 
-    // CASE 2: Inline comment detection
-    const inlineMatch = line.match(/^(.*?)(?<!["'])(\s+)(#|\/\/|--|%|;)\s?(.*)$/);
-    if (inlineMatch && inlineMatch[1].trim()) {
-      const codePart = inlineMatch[1];
-      const marker = inlineMatch[3];
-      const commentText = inlineMatch[4];
+    // CASE 2: This line is code - check for inline comment
+    // Find the last occurrence of a comment marker that's not in a string
+    // We scan from right to left to find the actual comment marker
+    let inlineComment = null;
+    for (const marker of commentMarkers) {
+      const markerIndex = line.lastIndexOf(marker);
+      if (markerIndex === -1) continue;
+      
+      // Check if marker is preceded by whitespace (not part of string/expression)
+      const beforeMarker = line.substring(0, markerIndex);
+      if (beforeMarker.match(/\s$/) && beforeMarker.trim()) {
+        // This looks like a real comment
+        const codePart = beforeMarker.trimEnd();
+        const commentText = line.substring(markerIndex + marker.length).trim();
+        
+        // Extra check for // in expressions (skip if looks like division)
+        if (marker === '//' && codePart.match(/[\w\]\)]$/) && commentText.match(/^\d/)) {
+          continue; // Likely division operator
+        }
+        
+        inlineComment = {
+          codePart,
+          marker,
+          commentText
+        };
+        break;
+      }
+    }
+    
+    if (inlineComment) {
       comments.push({
         type: "inline",
-        anchor: hashLine(codePart, i),  // anchor by code hash
-        text: commentText,
-        marker,
-        codeLine: codePart,
+        anchor: hashLine(inlineComment.codePart, 0), // Just content hash
+        originalLine: i,
+        text: inlineComment.commentText,
+        marker: inlineComment.marker,
       });
     }
 
-    // CASE 3: Buffered block comment above code line
+    // CASE 3: We have buffered comment lines above this code line
+    // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
       comments.push({
         type: "block",
-        anchor: hashLine(line, i),  // anchor hash of the code line below
+        anchor: hashLine(line, 0), // Just content hash
         insertAbove: true,
         block: commentBuffer,
       });
-      commentBuffer = [];
+      commentBuffer = []; // Clear buffer for next block
     }
   }
 
-  // CASE 4: File header comments
+  // CASE 4: Handle comments at the top of file (before any code)
+  // These are typically file headers, copyright notices, or module docstrings
   if (commentBuffer.length > 0) {
-    comments.push({
+    // Find the first actual line of code in the file
+    const firstCodeIndex = lines.findIndex((l) => l.trim() && !isComment(l));
+    const anchorLine = firstCodeIndex >= 0 ? firstCodeIndex : 0;
+    
+    // Insert this block at the beginning of the comments array
+    comments.unshift({
       type: "block",
-      anchor: "__FILE_START__", // sentinel for top-of-file comments
+      anchor: hashLine(lines[anchorLine] || "", 0), // Just content hash
       insertAbove: true,
       block: commentBuffer,
     });
@@ -139,33 +201,54 @@ function injectComments(cleanText, comments) {
   const lines = cleanText.split("\n");
   const result = [];  // Will contain the final reconstructed code
 
-  // Build a map of line content hash -> line index for the clean code
-  const lineHashToIndex = new Map();
+  // Build a map of line content hash -> array of line indices (handles duplicates)
+  const lineHashToIndices = new Map();
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].trim()) {
-      const hash = hashLine(lines[i], i);
-      lineHashToIndex.set(hash, i);
+      const hash = hashLine(lines[i], 0); // Content-only hash
+      if (!lineHashToIndices.has(hash)) {
+        lineHashToIndices.set(hash, []);
+      }
+      lineHashToIndices.get(hash).push(i);
     }
   }
 
-  // Separate and sort comments by type for efficient processing
-  const blockComments = comments.filter(c => c.type === "block");
-  const inlineComments = comments.filter(c => c.type === "inline");
+  // Separate comments by type and sort by originalLine
+  const blockComments = comments.filter(c => c.type === "block").sort((a, b) => {
+    const aLine = a.block[0]?.originalLine || 0;
+    const bLine = b.block[0]?.originalLine || 0;
+    return aLine - bLine;
+  });
+  const inlineComments = comments.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
 
-  // Build maps: anchor hash -> comment
+  // Track which occurrence of each duplicate line we've used
+  const anchorUsageCount = new Map();
+
+  // Build maps: line index -> comment
   const blockMap = new Map();
   for (const block of blockComments) {
-    const lineIndex = lineHashToIndex.get(block.anchor);
-    if (lineIndex !== undefined) {
-      blockMap.set(lineIndex, block);
+    const indices = lineHashToIndices.get(block.anchor);
+    if (indices && indices.length > 0) {
+      const usageCount = anchorUsageCount.get(block.anchor) || 0;
+      const targetIndex = indices[Math.min(usageCount, indices.length - 1)];
+      anchorUsageCount.set(block.anchor, usageCount + 1);
+      
+      if (!blockMap.has(targetIndex)) {
+        blockMap.set(targetIndex, []);
+      }
+      blockMap.get(targetIndex).push(block);
     }
   }
 
   const inlineMap = new Map();
   for (const inline of inlineComments) {
-    const lineIndex = lineHashToIndex.get(inline.anchor);
-    if (lineIndex !== undefined) {
-      inlineMap.set(lineIndex, inline);
+    const indices = lineHashToIndices.get(inline.anchor);
+    if (indices && indices.length > 0) {
+      const usageCount = anchorUsageCount.get(inline.anchor) || 0;
+      const targetIndex = indices[Math.min(usageCount, indices.length - 1)];
+      anchorUsageCount.set(inline.anchor, usageCount + 1);
+      
+      inlineMap.set(targetIndex, inline);
     }
   }
 
@@ -173,11 +256,13 @@ function injectComments(cleanText, comments) {
   for (let i = 0; i < lines.length; i++) {
     // STEP 1: Insert any block comments anchored to this line
     // These go ABOVE the code line
-    const block = blockMap.get(i);
-    if (block) {
-      for (const c of block.block) {
-        // Reconstruct: indent + marker + space + text
-        result.push(`${c.indent || ""}${c.marker || "//"} ${c.text}`);
+    const blocks = blockMap.get(i);
+    if (blocks) {
+      for (const block of blocks) {
+        for (const c of block.block) {
+          // Reconstruct: indent + marker + text (text already has space if needed)
+          result.push(`${c.indent || ""}${c.marker || "//"}${c.text ? " " + c.text : ""}`);
+        }
       }
     }
 
@@ -187,8 +272,8 @@ function injectComments(cleanText, comments) {
     // STEP 3: Check if this line has an inline comment
     const inline = inlineMap.get(i);
     if (inline) {
-      // Append the inline comment to the end of the code line
-      line += `  ${inline.marker || "//"} ${inline.text}`;
+      // Append the inline comment (text already has space if needed)
+      line += `  ${inline.marker || "//"}${inline.text ? " " + inline.text : ""}`;
     }
 
     result.push(line);
