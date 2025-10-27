@@ -723,6 +723,72 @@ async function activate(context) {
       preview: true,  // Use preview tab (can be replaced)
     });
 
+    // Setup symbol-based click-to-jump (bidirectional)
+    // Click-to-jump: clicking source jumps temp view to matching code
+    const sourceEditor = editor;
+    
+    scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
+      if (!vcmEditor) return;
+      
+      // Only jump when clicking in the SOURCE editor
+      if (e.textEditor !== sourceEditor) return;
+      
+      const cursorPos = e.selections[0].active;
+      const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
+      if (!wordRange) return;
+      
+      const symbolAtCursor = sourceEditor.document.getText(wordRange);
+      if (symbolAtCursor.length < 2) return;
+      
+      const targetText = vcmEditor.document.getText();
+      const targetLines = targetText.split('\n');
+      
+      // Search for the symbol - prioritize definitions, then any occurrence
+      let targetLine = -1;
+      
+      // First pass: look for definitions
+      const defPatterns = [
+        new RegExp(`^\\s*def\\s+${symbolAtCursor}\\s*\\(`),
+        new RegExp(`^\\s*class\\s+${symbolAtCursor}\\s*[:\\(]`),
+        new RegExp(`^\\s*function\\s+${symbolAtCursor}\\s*\\(`),
+        new RegExp(`^\\s*const\\s+${symbolAtCursor}\\s*=`),
+        new RegExp(`^\\s*let\\s+${symbolAtCursor}\\s*=`),
+        new RegExp(`^\\s*var\\s+${symbolAtCursor}\\s*=`),
+      ];
+      
+      for (let i = 0; i < targetLines.length; i++) {
+        for (const pattern of defPatterns) {
+          if (pattern.test(targetLines[i])) {
+            targetLine = i;
+            break;
+          }
+        }
+        if (targetLine >= 0) break;
+      }
+      
+      // Second pass: if no definition found, find first occurrence
+      if (targetLine < 0) {
+        const symbolRegex = new RegExp(`\\b${symbolAtCursor}\\b`);
+        for (let i = 0; i < targetLines.length; i++) {
+          if (symbolRegex.test(targetLines[i])) {
+            targetLine = i;
+            break;
+          }
+        }
+      }
+      
+      // Jump ONLY the temp view to the target line
+      if (targetLine >= 0) {
+        const targetPos = new vscode.Position(targetLine, 0);
+        vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
+        vcmEditor.revealRange(
+          new vscode.Range(targetPos, targetPos),
+          vscode.TextEditorRevealType.InCenter
+        );
+      }
+    });
+    context.subscriptions.push(scrollListener);
+
     // Decorate the banner
     const banner = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
