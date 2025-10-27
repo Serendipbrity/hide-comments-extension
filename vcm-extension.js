@@ -723,87 +723,79 @@ async function activate(context) {
       preview: true,  // Use preview tab (can be replaced)
     });
 
-    // Setup symbol-based click-to-jump (bidirectional)
-    // Click-to-jump: clicking source jumps temp view to matching code
+    // Setup bidirectional click-to-jump (source → split view)
     const sourceEditor = editor;
     
+    let activeHighlight;
+
     scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
       if (!vcmEditor) return;
-      
-      // Only jump when clicking in the SOURCE editor
       if (e.textEditor !== sourceEditor) return;
-      
+
       const cursorPos = e.selections[0].active;
       const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
       if (!wordRange) return;
-      
-      const symbolAtCursor = sourceEditor.document.getText(wordRange);
-      if (symbolAtCursor.length < 2) return;
-      
+
+      const word = sourceEditor.document.getText(wordRange);
+      if (!word || word.length < 2) return;
+
+      // Extract line context to improve matching accuracy
+      const sourceLine = sourceEditor.document.lineAt(cursorPos.line).text.trim();
       const targetText = vcmEditor.document.getText();
-      const targetLines = targetText.split('\n');
-      
-      // Search for the symbol - prioritize definitions, then any occurrence
-      let targetLine = -1;
-      
-      // First pass: look for definitions
-      const defPatterns = [
-        new RegExp(`^\\s*def\\s+${symbolAtCursor}\\s*\\(`),
-        new RegExp(`^\\s*class\\s+${symbolAtCursor}\\s*[:\\(]`),
-        new RegExp(`^\\s*function\\s+${symbolAtCursor}\\s*\\(`),
-        new RegExp(`^\\s*const\\s+${symbolAtCursor}\\s*=`),
-        new RegExp(`^\\s*let\\s+${symbolAtCursor}\\s*=`),
-        new RegExp(`^\\s*var\\s+${symbolAtCursor}\\s*=`),
-      ];
-      
-      for (let i = 0; i < targetLines.length; i++) {
-        for (const pattern of defPatterns) {
-          if (pattern.test(targetLines[i])) {
-            targetLine = i;
-            break;
-          }
-        }
-        if (targetLine >= 0) break;
+      const targetLines = targetText.split("\n");
+
+      // Try to find the same line context first (exact match or partial)
+      let targetLine = targetLines.findIndex(line => line.trim() === sourceLine.trim());
+      if (targetLine === -1) {
+        // fallback: find first line containing the word as whole word
+        const wordRegex = new RegExp(`\\b${word}\\b`);
+        targetLine = targetLines.findIndex(line => wordRegex.test(line));
       }
-      
-      // Second pass: if no definition found, find first occurrence
-      if (targetLine < 0) {
-        const symbolRegex = new RegExp(`\\b${symbolAtCursor}\\b`);
-        for (let i = 0; i < targetLines.length; i++) {
-          if (symbolRegex.test(targetLines[i])) {
-            targetLine = i;
-            break;
-          }
-        }
+
+      if (targetLine === -1) return;
+
+      // Jump + highlight that line
+      const targetPos = new vscode.Position(targetLine, 0);
+      vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
+      vcmEditor.revealRange(
+        new vscode.Range(targetPos, targetPos),
+        vscode.TextEditorRevealType.InCenter
+      );
+
+      // Remove previous highlight if exists
+      if (activeHighlight) {
+        activeHighlight.dispose();
+        activeHighlight = null;
       }
-      
-      // Jump ONLY the temp view to the target line
-      if (targetLine >= 0) {
-        const targetPos = new vscode.Position(targetLine, 0);
-        vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
-        vcmEditor.revealRange(
-          new vscode.Range(targetPos, targetPos),
-          vscode.TextEditorRevealType.InCenter
-        );
-      }
+
+      // Create a highlight using the editor’s built-in selection color
+      activeHighlight = vscode.window.createTextEditorDecorationType({
+        backgroundColor: new vscode.ThemeColor("editor.selectionBackground"),
+        isWholeLine: true,
+      });
+
+      vcmEditor.setDecorations(activeHighlight, [
+        new vscode.Range(targetPos, targetPos),
+      ]);
     });
     context.subscriptions.push(scrollListener);
 
-    // Decorate the banner
-    const banner = vscode.window.createTextEditorDecorationType({
-      isWholeLine: true,
-      before: {
-        contentText: `💬 ${vcmLabel} (${labelType})`,
-        color: "#00ff88",
-        fontWeight: "bold",
-        backgroundColor: "#00330088",
-        margin: "0 1rem 0 0",
-      },
-    });
-    vcmEditor.setDecorations(banner, [new vscode.Range(0, 0, 0, 0)]);
-  });
-  context.subscriptions.push(toggleSplitView);
-}
+
+        // Decorate the banner
+        const banner = vscode.window.createTextEditorDecorationType({
+          isWholeLine: true,
+          before: {
+            contentText: `💬 ${vcmLabel} (${labelType})`,
+            color: "#00ff88",
+            fontWeight: "bold",
+            backgroundColor: "#00330088",
+            margin: "0 1rem 0 0",
+          },
+        });
+        vcmEditor.setDecorations(banner, [new vscode.Range(0, 0, 0, 0)]);
+      });
+      context.subscriptions.push(toggleSplitView);
+    }
 
 // Extension deactivation - cleanup resources
 function deactivate() {
