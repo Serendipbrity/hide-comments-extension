@@ -14,8 +14,16 @@
   "contributes": {
     "commands": [
       {
-        "command": "vcm.toggleComments",
-        "title": "VCM: Toggle Comments View"
+        "command": "vcm.toggleCurrentFileComments",
+        "title": "VCM: --- Current File: --- View/Hide Comments"
+      },
+      {
+        "command": "vcm.toggleSplitViewComments",
+        "title": "VCM: --- Split View: --- View/Hide Comments"
+      },
+      {
+        "command": "vcm.toggleLocalComments",
+        "title": "VCM: Hide/Show Local Comments (Repo-Wide)"
       }
     ],
     "keybindings": [

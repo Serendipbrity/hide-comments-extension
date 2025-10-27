@@ -673,7 +673,7 @@ async function activate(context) {
   // Currently configured: source (with comments) -> right pane (without comments)
   // TODO: Make this configurable to show comments on right instead
   
-  const toggleSplitView = vscode.commands.registerCommand("vcm.toggleComments", async () => {
+  const toggleSplitView = vscode.commands.registerCommand("vcm.toggleSplitViewComments", async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
@@ -706,8 +706,10 @@ async function activate(context) {
     const showVersion = hasComments ? clean : withComments;
     const labelType = hasComments ? "clean" : "with comments";
 
+    // Insert timestamp before file extension to preserve language detection
+    const uniqueLabel = vcmLabel.replace(/(\.[^/.]+)$/, `_${Date.now()}$1`);
     // Create virtual document with vcm-view: scheme
-    tempUri = vscode.Uri.parse(`vcm-view:${vcmLabel}`);
+    tempUri = vscode.Uri.parse(`vcm-view:${uniqueLabel}`);
     provider.update(tempUri, showVersion);
 
 
