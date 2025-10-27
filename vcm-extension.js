@@ -630,6 +630,13 @@ async function activate(context) {
     let newText;
 
     if (hasComments) {
+      // Ensure a .vcm file exists before stripping
+      try {
+        await vscode.workspace.fs.stat(vcmFileUri);
+      } catch {
+        // No .vcm yet — extract and save before removing comments
+        await saveVCM(doc);
+      }
       // File has comments -> strip them
       newText = stripComments(text, doc.uri.path);
       vscode.window.showInformationMessage("VCM: Comments hidden (clean view)");
