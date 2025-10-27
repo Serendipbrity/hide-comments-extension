@@ -1,130 +1,193 @@
+// ==============================================================================
+// VCM (Visual Comment Manager) Extension for VS Code
+// ==============================================================================
+// This extension provides multiple modes for managing comments in source code:
+// 1. Split view: Source on left, clean/commented version on right
+// 2. Single file toggle: Hide/show comments in the same file
+// 3. Persistent storage: Comments saved to .vcm directory for reconstruction
+// ==============================================================================
+
 const vscode = require("vscode");
 const crypto = require("crypto");
 
-let vcmStatus;
-let vcmEditor;
-let tempUri;
-let scrollListener;
+// Global state variables for the extension
+let vcmStatus;           // Status bar item showing VCM state
+let vcmEditor;           // Reference to the VCM split view editor
+let tempUri;             // URI for the temporary VCM view document
+let scrollListener;      // Event listener for cursor movement between panes
+let vcmSyncEnabled = true; // Flag to temporarily disable .vcm file updates during toggles
 
-// Register custom content provider for vcm-view scheme
+// -----------------------------------------------------------------------------
+// Utility Helpers
+// -----------------------------------------------------------------------------
+
+// Content provider for the custom "vcm-view:" URI scheme
+// This allows us to display virtual documents in VS Code without creating real files
 class VCMContentProvider {
   constructor() {
-    this.content = new Map();
+    this.content = new Map(); // Map of URI -> document content
   }
+  
+  // Called by VS Code when it needs to display a vcm-view: document
   provideTextDocumentContent(uri) {
     return this.content.get(uri.toString()) || "";
   }
+  
+  // Update the content for a specific URI
   update(uri, content) {
     this.content.set(uri.toString(), content);
   }
 }
 
-// Hash a line of code (with line index salt for uniqueness)
+// Create a unique hash for each line of code
+// Used to track where comments belong even when line numbers change
+// Format: MD5(trimmed_line)
+// Example: "x = 5::42" -> "a3f2b1c4"
 function hashLine(line, lineIndex) {
-  return crypto.createHash('md5').update(line.trim() + "::" + lineIndex).digest('hex').substring(0, 8);
+  return crypto.createHash("md5")
+    .update(line.trim())
+    .digest("hex")
+    .substring(0, 8);
 }
 
-// Extract comments and anchor them to next non-comment line
+// -----------------------------------------------------------------------------
+// Comment Extraction + Injection
+// -----------------------------------------------------------------------------
+
+// Parse source code and extract all comments with their anchor points
+// Returns an array of comment objects that can be saved to .vcm files
+// 
+// Comment types:
+// - "block": Multi-line comments above code (e.g., docstrings, headers)
+// - "inline": Comments on the same line as code (e.g., x = 5  # counter)
+//
+// Key concept: Comments are "anchored" to the next line of code below them
+// This allows reconstruction even if line numbers change
+// Extract all comments and anchor them to the next real code line (by hash)
 function extractComments(text, filePath) {
   const lines = text.split("\n");
   const comments = [];
   let commentBuffer = [];
-  
+
+  const isComment = (l) => l.trim().match(/^(#|\/\/|--|%|;)/);
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    
-    // Reset buffer on blank lines to prevent drift
-    if (!trimmed) {
-      if (commentBuffer.length) commentBuffer = [];
+    if (!trimmed) continue;
+
+    // CASE 1: This line is a standalone comment
+    if (isComment(line)) {
+      const match = line.match(/^(\s*)(#|\/\/|--|%|;)\s?(.*)$/);
+      if (match) {
+        commentBuffer.push({
+          text: match[3],
+          indent: match[1],
+          marker: match[2],
+          originalLine: i,
+        });
+      }
       continue;
     }
-    
-    // Check if line is a comment
-    const commentMatch = line.match(/^(\s*)(#|\/\/|--|%|;)\s?(.*)$/);
-    
-    if (commentMatch) {
-      // This is a comment line - add to buffer
-      const indent = commentMatch[1];
-      const marker = commentMatch[2];
-      const text = commentMatch[3];
-      
-      commentBuffer.push({
-        text: text,
-        indent: indent,
-        marker: marker,
-        originalLine: i
+
+    // CASE 2: Inline comment detection
+    const inlineMatch = line.match(/^(.*?)(?<!["'])(\s+)(#|\/\/|--|%|;)\s?(.*)$/);
+    if (inlineMatch && inlineMatch[1].trim()) {
+      const codePart = inlineMatch[1];
+      const marker = inlineMatch[3];
+      const commentText = inlineMatch[4];
+      comments.push({
+        type: "inline",
+        anchor: hashLine(codePart, i),  // anchor by code hash
+        text: commentText,
+        marker,
+        codeLine: codePart,
       });
-    } else {
-      // This is a code line
-      
-      // Check for inline comment (with negative lookbehind to avoid strings)
-      // Matches: code + whitespace + comment marker (not inside quotes)
-      const inlineMatch = line.match(/^(.*?)(?<!["'])(\s+)(#|\/\/|--|%|;)\s?(.*)$/);
-      
-      if (inlineMatch && inlineMatch[1].trim()) {
-        // Has inline comment
-        const codePart = inlineMatch[1];
-        const marker = inlineMatch[3];
-        const commentText = inlineMatch[4];
-        
-        comments.push({
-          type: "inline",
-          anchor: hashLine(codePart, i),
-          anchorLine: i,
-          text: commentText,
-          marker: marker,
-          codeLine: codePart
-        });
-      }
-      
-      // If we have buffered comments above, attach them to this code line
-      if (commentBuffer.length > 0) {
-        comments.push({
-          type: "block",
-          anchor: hashLine(line, i),
-          anchorLine: i,
-          block: commentBuffer,
-          codeLine: line.trim()
-        });
-        commentBuffer = [];
-      }
+    }
+
+    // CASE 3: Buffered block comment above code line
+    if (commentBuffer.length > 0) {
+      comments.push({
+        type: "block",
+        anchor: hashLine(line, i),  // anchor hash of the code line below
+        insertAbove: true,
+        block: commentBuffer,
+      });
+      commentBuffer = [];
     }
   }
-  
+
+  // CASE 4: File header comments
+  if (commentBuffer.length > 0) {
+    comments.push({
+      type: "block",
+      anchor: "__FILE_START__", // sentinel for top-of-file comments
+      insertAbove: true,
+      block: commentBuffer,
+    });
+  }
+
   return comments;
 }
 
-// Rebuild text with comments injected at anchors (anchorLine-based)
+// Reconstruct source code by injecting comments back into clean code
+// Takes:
+//   cleanText - Code with all comments removed
+//   comments - Array of comment objects from extractComments()
+// Returns: Full source code with comments restored
 function injectComments(cleanText, comments) {
   const lines = cleanText.split("\n");
-  const result = [];
+  const result = [];  // Will contain the final reconstructed code
 
-  // Separate block and inline for clarity
-  const blockComments = comments.filter(c => c.type === "block" || c.type === "orphan");
+  // Build a map of line content hash -> line index for the clean code
+  const lineHashToIndex = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim()) {
+      const hash = hashLine(lines[i], i);
+      lineHashToIndex.set(hash, i);
+    }
+  }
+
+  // Separate and sort comments by type for efficient processing
+  const blockComments = comments.filter(c => c.type === "block");
   const inlineComments = comments.filter(c => c.type === "inline");
 
-  // Sort blocks by anchorLine to ensure order
-  blockComments.sort((a, b) => a.anchorLine - b.anchorLine);
-  inlineComments.sort((a, b) => a.anchorLine - b.anchorLine);
+  // Build maps: anchor hash -> comment
+  const blockMap = new Map();
+  for (const block of blockComments) {
+    const lineIndex = lineHashToIndex.get(block.anchor);
+    if (lineIndex !== undefined) {
+      blockMap.set(lineIndex, block);
+    }
+  }
 
+  const inlineMap = new Map();
+  for (const inline of inlineComments) {
+    const lineIndex = lineHashToIndex.get(inline.anchor);
+    if (lineIndex !== undefined) {
+      inlineMap.set(lineIndex, inline);
+    }
+  }
+
+  // Rebuild the file line by line
   for (let i = 0; i < lines.length; i++) {
-    // Before writing this line, check if there’s a block comment anchored here
-    const block = blockComments.filter(b => b.anchorLine === i);
-    if (block.length > 0) {
-      for (const b of block) {
-        for (const c of b.block) {
-          result.push(`${c.indent || ""}${c.marker || "//"} ${c.text}`);
-        }
+    // STEP 1: Insert any block comments anchored to this line
+    // These go ABOVE the code line
+    const block = blockMap.get(i);
+    if (block) {
+      for (const c of block.block) {
+        // Reconstruct: indent + marker + space + text
+        result.push(`${c.indent || ""}${c.marker || "//"} ${c.text}`);
       }
     }
 
-    // Now the actual code line
+    // STEP 2: Add the code line itself
     let line = lines[i];
-
-    // Check for inline comment attached to this line
-    const inline = inlineComments.find(ic => ic.anchorLine === i);
+    
+    // STEP 3: Check if this line has an inline comment
+    const inline = inlineMap.get(i);
     if (inline) {
+      // Append the inline comment to the end of the code line
       line += `  ${inline.marker || "//"} ${inline.text}`;
     }
 
@@ -134,333 +197,215 @@ function injectComments(cleanText, comments) {
   return result.join("\n");
 }
 
-// Strip all comments from text but keep indentation and spacing
+// Remove all comments from source code, leaving only code and blank lines
+// This creates the "clean" version for split view or toggle mode
+// Process:
+// 1. Filter out lines that are pure comments (start with #, //, etc)
+// 2. Strip inline comments from mixed code+comment lines
+// 3. Preserve blank lines to maintain code structure
 function stripComments(text) {
   return text
     .split("\n")
     .filter(line => {
       const trimmed = line.trim();
-      // Keep blank lines OR lines that aren't pure comment lines
+      // Keep blank lines OR lines that aren't pure comments
       return !trimmed || !/^(#|\/\/|--|%|;)/.test(trimmed);
     })
     .map(line => {
-      // Remove inline comments from code lines (anything after comment marker)
-      return line.replace(/\s+(#|\/\/|--|%|;).*$/, '');
+      // Remove inline comments: everything after comment marker
+      // Regex matches: whitespace + comment marker + rest of line
+      return line.replace(/\s+(#|\/\/|--|%|;).*$/, "");
     })
     .join("\n");
 }
 
+// -----------------------------------------------------------------------------
+// Extension Activate
+// -----------------------------------------------------------------------------
+
 async function activate(context) {
+  // Load user configuration
   const config = vscode.workspace.getConfiguration("vcm");
-  const autoSplit = config.get("autoSplitView", true);
-  
-  // Ensure .vcm directory exists
+  const autoSplit = config.get("autoSplitView", true);  // Auto-split vs same pane
+  const liveSync = config.get("liveSync", false);       // Auto-save .vcm on edit
+
+  // Create .vcm directory in workspace root
+  // This stores .vcm.json files that mirror the comment structure
   const vcmDir = vscode.Uri.joinPath(
     vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(process.cwd()),
     ".vcm"
   );
-  
-  try {
-    await vscode.workspace.fs.createDirectory(vcmDir);
-  } catch (e) {
-    // Directory might already exist
-  }
-  
-  // Close any lingering VCM views from previous session
-  setTimeout(async () => {
-    const groups = vscode.window.tabGroups.all;
-    if (groups.length > 1) {
-      for (let i = 1; i < groups.length; i++) {
-        const group = groups[i];
-        if (group.tabs.length === 0) {
-          await vscode.commands.executeCommand("workbench.action.closeGroup");
-        } else {
-          for (const tab of group.tabs) {
-            if (tab.input?.uri?.scheme === "vcm-view") {
-              await vscode.commands.executeCommand("workbench.action.closeGroup");
-              break;
-            }
-          }
-        }
-      }
-    }
-  }, 100);
-  
-  // Register the content provider
+  await vscode.workspace.fs.createDirectory(vcmDir).catch(() => {});
+
+  // Register content provider for vcm-view: scheme
+  // This allows us to create virtual documents that display in the editor
   const provider = new VCMContentProvider();
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider("vcm-view", provider)
   );
 
-  // Helper to save .vcm file
+  // ---------------------------------------------------------------------------
+  // SAVE VCM HANDLER
+  // ---------------------------------------------------------------------------
+  // Extracts comments from a document and saves them to .vcm/<file>.vcm.json
+  // This creates a persistent mirror of the comment structure
   async function saveVCM(doc) {
+    // Only process real files (not virtual documents or .vcm files themselves)
     if (doc.uri.scheme !== "file") return;
     if (doc.uri.path.includes("/.vcm/")) return;
     if (doc.languageId === "json") return;
 
     const text = doc.getText();
     const comments = extractComments(text, doc.uri.path);
-    
+
+    // Create .vcm file path mirroring source file structure
+    // Example: src/app.py -> .vcm/src/app.py.vcm.json
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
-    
-    // Ensure intermediate directories exist
+
+    // Ensure nested directories exist
     const pathParts = relativePath.split(/[\\/]/);
     if (pathParts.length > 1) {
       const vcmSubdir = vscode.Uri.joinPath(vcmDir, pathParts.slice(0, -1).join("/"));
-      try {
-        await vscode.workspace.fs.createDirectory(vcmSubdir);
-      } catch (e) {
-        // Directory might already exist
-      }
+      await vscode.workspace.fs.createDirectory(vcmSubdir).catch(() => {});
     }
-    
+
+    // Save comment data as JSON
     const vcmData = {
       file: relativePath,
       lastModified: new Date().toISOString(),
-      comments: comments
+      comments,  // Array of comment objects from extractComments()
     };
-    
+
     await vscode.workspace.fs.writeFile(
       vcmFileUri,
       Buffer.from(JSON.stringify(vcmData, null, 2), "utf8")
     );
   }
 
-  /// Global live sync guard
-  let vcmSyncEnabled = true;
+  // ---------------------------------------------------------------------------
+  // WATCHERS
+  // ---------------------------------------------------------------------------
 
-  // Hook for manual save
+  // Watch for file saves and update .vcm files
+  // vcmSyncEnabled flag prevents infinite loops during toggles
   const saveWatcher = vscode.workspace.onDidSaveTextDocument(async (doc) => {
-    if (!vcmSyncEnabled) return; // skip if toggling
+    if (!vcmSyncEnabled) return;  // Skip if we're in the middle of a toggle
     await saveVCM(doc);
   });
   context.subscriptions.push(saveWatcher);
 
-  // Hook for live sync while typing (optional)
-  const liveSync = config.get("liveSync", false);
+  // Optional: Watch for file edits and auto-save .vcm after 2 seconds
+  // This provides real-time .vcm updates but can be disabled for performance
   if (liveSync) {
     let writeTimeout;
     const changeWatcher = vscode.workspace.onDidChangeTextDocument((e) => {
-      if (!vcmSyncEnabled) return; // skip if toggling
+      if (!vcmSyncEnabled) return;
       clearTimeout(writeTimeout);
       writeTimeout = setTimeout(() => saveVCM(e.document), 2000);
     });
     context.subscriptions.push(changeWatcher);
   }
 
-  function handleLiveSync(e) {
-    if (!liveSyncEnabled) return; // Skip if disabled
-    clearTimeout(writeTimeout);
-    writeTimeout = setTimeout(() => saveVCM(e.document), 2000);
-  }
-
-  const changeWatcher = vscode.workspace.onDidChangeTextDocument(handleLiveSync);
-  context.subscriptions.push(changeWatcher);
-
-
-  // ------------------------------------------------------------
-  // Command: Toggle comments for current file (same file view)
-  // ------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // COMMAND: Toggle same file (hide/show comments)
+  // ---------------------------------------------------------------------------
+  // Toggles comments on/off in the current file without creating a split view
+  // Process:
+  // 1. If file has comments: strip them and show clean version
+  // 2. If file is clean: restore comments from .vcm file
+  
   const toggleCurrentFileComments = vscode.commands.registerCommand("vcm.toggleCurrentFileComments", async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
-    // 🔒 Disable sync
+    // Disable .vcm sync during toggle to prevent overwriting
     vcmSyncEnabled = false;
-
+    
     const doc = editor.document;
-    const fileText = doc.getText();
+    const text = doc.getText();
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
-    const vcmDir = vscode.Uri.joinPath(
-      vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(process.cwd()),
-      ".vcm"
-    );
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
-    const hasComments = /(^\s*(#|\/\/|--|%|;)|\s+(#|\/\/|--|%|;)).*/m.test(fileText);
+    // Check if current file has any comments
+    const hasComments = /(^\s*(#|\/\/|--|%|;)|\s+(#|\/\/|--|%|;)).*/m.test(text);
     let newText;
 
     if (hasComments) {
-      newText = stripComments(fileText);
+      // File has comments -> strip them
+      newText = stripComments(text);
       vscode.window.showInformationMessage("VCM: Comments hidden (clean view)");
     } else {
+      // File is clean -> restore comments from .vcm
       try {
-        const vcmFile = await vscode.workspace.fs.readFile(vcmFileUri);
-        const vcmData = JSON.parse(vcmFile.toString());
-        newText = injectComments(fileText, vcmData.comments || []);
+        const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
+        newText = injectComments(text, vcmData.comments || []);
         vscode.window.showInformationMessage("VCM: Comments restored from .vcm");
-      } catch (e) {
+      } catch {
         vscode.window.showErrorMessage("VCM: No .vcm data found — save once with comments first.");
-        vcmSyncEnabled = true; // re-enable before exit
+        vcmSyncEnabled = true;
         return;
       }
     }
 
+    // Replace entire document content
     const edit = new vscode.WorkspaceEdit();
     edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
     await vscode.workspace.applyEdit(edit);
     await vscode.commands.executeCommand("workbench.action.files.save");
-
-    // 🔓 Re-enable sync (delay ensures watchers don't fire mid-save)
-    setTimeout(() => {
-      vcmSyncEnabled = true;
-    }, 1000);
+    
+    // Re-enable sync after a delay to ensure save completes
+    setTimeout(() => (vcmSyncEnabled = true), 800);
   });
+  context.subscriptions.push(toggleCurrentFileComments);
 
-
-
-
-  // Main toggle command
-  const disposable = vscode.commands.registerCommand("vcm.toggleComments", async () => {
+  // ---------------------------------------------------------------------------
+  // COMMAND: Split view with/without comments
+  // ---------------------------------------------------------------------------
+  // Opens a split view with source on left and clean/commented version on right
+  // Currently configured: source (with comments) -> right pane (without comments)
+  // TODO: Make this configurable to show comments on right instead
+  
+  const toggleSplitView = vscode.commands.registerCommand("vcm.toggleComments", async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
-    // Toggle off if already in VCM mode
-    if (vcmEditor && vscode.window.activeTextEditor === vcmEditor) {
-      vcmEditor = null;
-      vcmStatus?.hide();
-      if (scrollListener) {
-        scrollListener.dispose();
-        scrollListener = null;
-      }
-
-      // Close only the VCM group
-      await vscode.commands.executeCommand("workbench.action.closeEditorsInGroup");
-
-      // Collapse empty right-hand group
-      const groups = vscode.window.tabGroups.all;
-      if (groups.length > 1) {
-        const rightGroup = groups[groups.length - 1];
-        const hasTabs = rightGroup.tabs.some(t => t.input?.uri?.scheme !== "vcm-view");
-        if (!hasTabs) {
-          await vscode.commands.executeCommand("workbench.action.joinAllGroups");
-        }
-      }
-
-      await vscode.commands.executeCommand("workbench.action.focusFirstEditorGroup");
-      return;
-    }
-
     const doc = editor.document;
+    const relativePath = vscode.workspace.asRelativePath(doc.uri);
+    const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
     const baseName = doc.fileName.split(/[\\/]/).pop();
     const vcmLabel = `VCM_${baseName}`;
 
-    // Load .vcm file if it exists
-    const relativePath = vscode.workspace.asRelativePath(doc.uri);
-    const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
-    
-    let comments = [];
+    // Load comment data from .vcm file, or extract from current file
+    let comments;
     try {
-      const vcmContent = await vscode.workspace.fs.readFile(vcmFileUri);
-      const vcmData = JSON.parse(vcmContent.toString());
+      const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
       comments = vcmData.comments || [];
-    } catch (e) {
-      // No .vcm file yet - extract from current file and save it
+    } catch {
+      // No .vcm file exists yet - extract and save
       comments = extractComments(doc.getText(), doc.uri.path);
       await saveVCM(doc);
     }
 
-    // Get clean version of the code
-    const cleanCode = stripComments(doc.getText());
-    
-    // Inject comments back in
-    const withComments = injectComments(cleanCode, comments);
+    // Create clean version and version with comments
+    const clean = stripComments(doc.getText());
+    const withComments = injectComments(clean, comments);
 
-    // Split to right without duplicating
-    if (autoSplit) await vscode.commands.executeCommand("workbench.action.focusFirstEditorGroup");
-
-    // Use custom scheme that won't prompt for save
+    // Create virtual document with vcm-view: scheme
     tempUri = vscode.Uri.parse(`vcm-view:${vcmLabel}`);
     provider.update(tempUri, withComments);
 
-    // Ensure only one group before opening
+    // Collapse any existing split groups to start fresh
     await vscode.commands.executeCommand("workbench.action.joinAllGroups");
-
-    // Open the VCM view with comments
+    
+    // Open in split view (beside) or same pane based on config
     const targetColumn = autoSplit ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active;
     vcmEditor = await vscode.window.showTextDocument(tempUri, {
       viewColumn: targetColumn,
-      preview: true,
-      preserveFocus: false,
+      preview: true,  // Use preview tab (can be replaced)
     });
 
-    // Reset layout tracking
-    setTimeout(async () => {
-      try {
-        await vscode.commands.executeCommand("workbench.action.focusFirstEditorGroup");
-      } catch (e) {
-        console.warn("VCM layout reset failed", e);
-      }
-    }, 150);
-    
-    // Setup symbol-based click-to-jump (bidirectional)
-    // Click-to-jump: clicking source jumps temp view to matching code
-    const sourceEditor = editor;
-    
-    scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
-      if (!vcmEditor) return;
-      
-      // Only jump when clicking in the SOURCE editor
-      if (e.textEditor !== sourceEditor) return;
-      
-      const cursorPos = e.selections[0].active;
-      const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
-      if (!wordRange) return;
-      
-      const symbolAtCursor = sourceEditor.document.getText(wordRange);
-      if (symbolAtCursor.length < 2) return;
-      
-      const targetText = vcmEditor.document.getText();
-      const targetLines = targetText.split('\n');
-      
-      // Search for the symbol - prioritize definitions, then any occurrence
-      let targetLine = -1;
-      
-      // First pass: look for definitions
-      const defPatterns = [
-        new RegExp(`^\\s*def\\s+${symbolAtCursor}\\s*\\(`),
-        new RegExp(`^\\s*class\\s+${symbolAtCursor}\\s*[:\\(]`),
-        new RegExp(`^\\s*function\\s+${symbolAtCursor}\\s*\\(`),
-        new RegExp(`^\\s*const\\s+${symbolAtCursor}\\s*=`),
-        new RegExp(`^\\s*let\\s+${symbolAtCursor}\\s*=`),
-        new RegExp(`^\\s*var\\s+${symbolAtCursor}\\s*=`),
-      ];
-      
-      for (let i = 0; i < targetLines.length; i++) {
-        for (const pattern of defPatterns) {
-          if (pattern.test(targetLines[i])) {
-            targetLine = i;
-            break;
-          }
-        }
-        if (targetLine >= 0) break;
-      }
-      
-      // Second pass: if no definition found, find first occurrence
-      if (targetLine < 0) {
-        const symbolRegex = new RegExp(`\\b${symbolAtCursor}\\b`);
-        for (let i = 0; i < targetLines.length; i++) {
-          if (symbolRegex.test(targetLines[i])) {
-            targetLine = i;
-            break;
-          }
-        }
-      }
-      
-      // Jump ONLY the temp view to the target line
-      if (targetLine >= 0) {
-        const targetPos = new vscode.Position(targetLine, 0);
-        vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
-        vcmEditor.revealRange(
-          new vscode.Range(targetPos, targetPos),
-          vscode.TextEditorRevealType.InCenter
-        );
-      }
-    });
-    context.subscriptions.push(scrollListener);
-          
-    // Header banner
+    // Add visual banner to identify VCM view
     const banner = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       before: {
@@ -472,49 +417,14 @@ async function activate(context) {
       },
     });
     vcmEditor.setDecorations(banner, [new vscode.Range(0, 0, 0, 0)]);
-
-    // Status bar indicator
-    if (!vcmStatus) {
-      vcmStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-      vcmStatus.command = "vcm.toggleComments";
-      context.subscriptions.push(vcmStatus);
-    }
-    vcmStatus.text = "💬 VCM: Comments Visible";
-    vcmStatus.color = "#00ff88";
-    vcmStatus.show();
   });
-
-  // Cleanup when VCM view closes
-  const cleanup = () => {
-    if (!vcmEditor) return;
-    const stillVisible = vscode.window.visibleTextEditors.some(e => e === vcmEditor);
-    if (!stillVisible) {
-      vcmEditor = null;
-      vcmStatus?.hide();
-      if (scrollListener) {
-        scrollListener.dispose();
-        scrollListener = null;
-      }
-      context.workspaceState.update('vcmViewActive', false);
-    }
-  };
-
-  context.subscriptions.push(
-    disposable,
-    vscode.window.onDidChangeVisibleTextEditors(cleanup),
-    vscode.workspace.onDidCloseTextDocument(cleanup)
-  );
-  
-  context.workspaceState.update('vcmViewActive', false);
+  context.subscriptions.push(toggleSplitView);
 }
 
+// Extension deactivation - cleanup resources
 function deactivate() {
-  if (scrollListener) {
-    scrollListener.dispose();
-  }
-  if (vcmEditor) {
-    vscode.commands.executeCommand("workbench.action.closeEditorsInGroup");
-  }
+  if (scrollListener) scrollListener.dispose();
+  if (vcmEditor) vscode.commands.executeCommand("workbench.action.closeEditorsInGroup");
 }
 
 module.exports = { activate, deactivate };
