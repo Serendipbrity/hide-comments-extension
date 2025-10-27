@@ -158,7 +158,9 @@ function extractComments(text, filePath) {
         // This looks like a real comment
         const codePart = beforeMarker.trimEnd();
         const commentText = line.substring(markerIndex + marker.length).trim();
-        
+
+        // Calculate the spacing between code and comment marker
+        const spacing = beforeMarker.length - codePart.length;
         // Extra check for // in expressions (skip if looks like division)
         if (marker === '//' && codePart.match(/[\w\]\)]$/) && commentText.match(/^\d/)) {
           continue; // Likely division operator
@@ -167,7 +169,8 @@ function extractComments(text, filePath) {
         inlineComment = {
           codePart,
           marker,
-          commentText
+          commentText,
+          spacing  // Store the original spacing
         };
         break;
       }
@@ -186,6 +189,7 @@ function extractComments(text, filePath) {
         originalLine: i,
         text: inlineComment.commentText,
         marker: inlineComment.marker,
+        spacing: inlineComment.spacing,  // Store the original spacing
       });
     }
 
@@ -371,8 +375,9 @@ function injectComments(cleanText, comments) {
     // STEP 3: Check if this line has an inline comment
     const inline = inlineMap.get(i);
     if (inline) {
-      // Append the inline comment (text already has space if needed)
-      line += `  ${inline.marker || "//"}${inline.text ? " " + inline.text : ""}`;
+      // Append the inline comment with original spacing (default to 2 spaces if not stored)
+      const spacing = " ".repeat(inline.spacing || 2);
+      line += `${spacing}${inline.marker || "//"}${inline.text ? " " + inline.text : ""}`;
     }
 
     result.push(line);
@@ -387,18 +392,105 @@ function injectComments(cleanText, comments) {
 // 1. Filter out lines that are pure comments (start with #, //, etc)
 // 2. Strip inline comments from mixed code+comment lines
 // 3. Preserve blank lines to maintain code structure
-function stripComments(text) {
+// 4. Handle strings properly - don't remove comment markers inside strings
+// 5. Language-aware: only remove markers appropriate for the file type
+function stripComments(text, filePath) {
+  // Detect language from file extension (same logic as extractComments)
+  const ext = filePath.split('.').pop().toLowerCase();
+  let commentMarkers;
+
+  if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
+    commentMarkers = ['#'];  // Python only uses #
+  } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
+    commentMarkers = ['//'];  // C-style languages
+  } else if (['sql', 'lua'].includes(ext)) {
+    commentMarkers = ['--'];  // SQL/Lua style
+  } else if (['m', 'matlab'].includes(ext)) {
+    commentMarkers = ['%'];  // MATLAB style
+  } else if (['asm', 's'].includes(ext)) {
+    commentMarkers = [';'];  // Assembly style
+  } else {
+    commentMarkers = ['#', '//', '--', '%', ';'];  // Default: support all
+  }
+
+  // Build regex pattern for this file type
+  const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const lineStartPattern = new RegExp(`^(${markerPattern})`);
+
+  // Helper: Find the position of an inline comment, accounting for strings
+  const findCommentStart = (line) => {
+    let inString = false;
+    let stringChar = null;
+    let escaped = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      const nextChar = line[i + 1];
+
+      // Handle escape sequences
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      // Track string state (single, double, or backtick quotes)
+      if (!inString && (char === '"' || char === "'" || char === '`')) {
+        inString = true;
+        stringChar = char;
+        continue;
+      }
+      if (inString && char === stringChar) {
+        inString = false;
+        stringChar = null;
+        continue;
+      }
+
+      // Only look for comment markers outside of strings
+      if (!inString) {
+        // Check each marker for this language
+        for (const marker of commentMarkers) {
+          if (marker.length === 2) {
+            // Two-character markers like //, --, etc.
+            if (char === marker[0] && nextChar === marker[1]) {
+              // Make sure there's whitespace before it (not part of code)
+              if (i > 0 && line[i - 1].match(/\s/)) {
+                return i - 1; // Include the whitespace
+              }
+            }
+          } else {
+            // Single-character markers like #, %, ;
+            if (char === marker) {
+              // Make sure there's whitespace before it
+              if (i > 0 && line[i - 1].match(/\s/)) {
+                return i - 1;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return -1; // No comment found
+  };
+
   return text
     .split("\n")
     .filter(line => {
       const trimmed = line.trim();
       // Keep blank lines OR lines that aren't pure comments
-      return !trimmed || !/^(#|\/\/|--|%|;)/.test(trimmed);
+      return !trimmed || !lineStartPattern.test(trimmed);
     })
     .map(line => {
-      // Remove inline comments: everything after comment marker
-      // Regex matches: whitespace + comment marker + rest of line
-      return line.replace(/\s+(#|\/\/|--|%|;).*$/, "");
+      // Remove inline comments: everything after comment marker (if not in string)
+      const commentPos = findCommentStart(line);
+      if (commentPos >= 0) {
+        return line.substring(0, commentPos).trimEnd();
+      }
+      return line;
     })
     .join("\n");
 }
@@ -511,13 +603,35 @@ async function activate(context) {
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
+    // Detect language-specific comment markers
+    const ext = doc.uri.path.split('.').pop().toLowerCase();
+    let commentMarkers;
+
+    if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
+      commentMarkers = ['#'];
+    } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
+      commentMarkers = ['//'];
+    } else if (['sql', 'lua'].includes(ext)) {
+      commentMarkers = ['--'];
+    } else if (['m', 'matlab'].includes(ext)) {
+      commentMarkers = ['%'];
+    } else if (['asm', 's'].includes(ext)) {
+      commentMarkers = [';'];
+    } else {
+      commentMarkers = ['#', '//', '--', '%', ';'];
+    }
+
+    // Build language-specific comment detection pattern
+    const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const commentPattern = new RegExp(`(^\\s*(${markerPattern})|\\s+(${markerPattern}))`, 'm');
+
     // Check if current file has any comments
-    const hasComments = /(^\s*(#|\/\/|--|%|;)|\s+(#|\/\/|--|%|;)).*/m.test(text);
+    const hasComments = commentPattern.test(text);
     let newText;
 
     if (hasComments) {
       // File has comments -> strip them
-      newText = stripComments(text);
+      newText = stripComments(text, doc.uri.path);
       vscode.window.showInformationMessage("VCM: Comments hidden (clean view)");
     } else {
       // File is clean -> restore comments from .vcm
@@ -572,7 +686,7 @@ async function activate(context) {
     }
 
     // Create clean version and version with comments
-    const clean = stripComments(doc.getText());
+    const clean = stripComments(doc.getText(), doc.uri.path);
     const withComments = injectComments(clean, comments);
 
     // Create virtual document with vcm-view: scheme
