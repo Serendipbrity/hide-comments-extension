@@ -695,12 +695,21 @@ async function activate(context) {
     }
 
     // Create clean version and version with comments
-    const clean = stripComments(doc.getText(), doc.uri.path);
+    const text = doc.getText();
+    const clean = stripComments(text, doc.uri.path);
     const withComments = injectComments(clean, comments);
+
+    // Determine if source already has comments
+    const hasComments = text.trim() !== clean.trim();
+
+    // If source has comments, show clean; otherwise, show commented
+    const showVersion = hasComments ? clean : withComments;
+    const labelType = hasComments ? "clean" : "with comments";
 
     // Create virtual document with vcm-view: scheme
     tempUri = vscode.Uri.parse(`vcm-view:${vcmLabel}`);
-    provider.update(tempUri, withComments);
+    provider.update(tempUri, showVersion);
+
 
     // Collapse any existing split groups to start fresh
     await vscode.commands.executeCommand("workbench.action.joinAllGroups");
@@ -712,11 +721,11 @@ async function activate(context) {
       preview: true,  // Use preview tab (can be replaced)
     });
 
-    // Add visual banner to identify VCM view
+    // Decorate the banner
     const banner = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       before: {
-        contentText: `💬 ${vcmLabel} (with comments)`,
+        contentText: `💬 ${vcmLabel} (${labelType})`,
         color: "#00ff88",
         fontWeight: "bold",
         backgroundColor: "#00330088",
