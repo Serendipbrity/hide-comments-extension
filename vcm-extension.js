@@ -63,6 +63,7 @@ function hashLine(line, lineIndex) {
 //
 // Key concept: Comments are "anchored" to the next line of code below them
 // This allows reconstruction even if line numbers change
+// Context hashes (prevHash, nextHash) help disambiguate identical anchor lines
 function extractComments(text, filePath) {
   const lines = text.split("\n");
   const comments = [];      // Final array of all extracted comments
@@ -96,6 +97,28 @@ function extractComments(text, filePath) {
       if (trimmed.startsWith(marker)) return true;
     }
     return false;
+  };
+
+  // Helper: Find the next non-blank code line after index i
+  const findNextCodeLine = (startIndex) => {
+    for (let j = startIndex + 1; j < lines.length; j++) {
+      const trimmed = lines[j].trim();
+      if (trimmed && !isComment(lines[j])) {
+        return j;
+      }
+    }
+    return -1;
+  };
+
+  // Helper: Find the previous non-blank code line before index i
+  const findPrevCodeLine = (startIndex) => {
+    for (let j = startIndex - 1; j >= 0; j--) {
+      const trimmed = lines[j].trim();
+      if (trimmed && !isComment(lines[j])) {
+        return j;
+      }
+    }
+    return -1;
   };
 
   // Process each line sequentially
@@ -151,9 +174,15 @@ function extractComments(text, filePath) {
     }
     
     if (inlineComment) {
+      // Store context: previous and next code lines
+      const prevIdx = findPrevCodeLine(i);
+      const nextIdx = findNextCodeLine(i);
+
       comments.push({
         type: "inline",
         anchor: hashLine(inlineComment.codePart, 0), // Just content hash
+        prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
+        nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         originalLine: i,
         text: inlineComment.commentText,
         marker: inlineComment.marker,
@@ -163,9 +192,15 @@ function extractComments(text, filePath) {
     // CASE 3: We have buffered comment lines above this code line
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
+      // Store context: previous code line and next code line
+      const prevIdx = findPrevCodeLine(i);
+      const nextIdx = findNextCodeLine(i);
+
       comments.push({
         type: "block",
         anchor: hashLine(line, 0), // Just content hash
+        prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
+        nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         insertAbove: true,
         block: commentBuffer,
       });
@@ -179,11 +214,16 @@ function extractComments(text, filePath) {
     // Find the first actual line of code in the file
     const firstCodeIndex = lines.findIndex((l) => l.trim() && !isComment(l));
     const anchorLine = firstCodeIndex >= 0 ? firstCodeIndex : 0;
-    
+
+    // For file header comments, there's no previous code line
+    const nextIdx = findNextCodeLine(anchorLine - 1);
+
     // Insert this block at the beginning of the comments array
     comments.unshift({
       type: "block",
       anchor: hashLine(lines[anchorLine] || "", 0), // Just content hash
+      prevHash: null, // No previous code line before file header
+      nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
       insertAbove: true,
       block: commentBuffer,
     });
@@ -213,6 +253,67 @@ function injectComments(cleanText, comments) {
     }
   }
 
+  // Helper: Find best matching line index using context hashes
+  const findBestMatch = (comment, candidateIndices, usedIndices) => {
+    if (candidateIndices.length === 1) {
+      return candidateIndices[0];
+    }
+
+    // Filter out already used indices
+    const available = candidateIndices.filter(idx => !usedIndices.has(idx));
+    if (available.length === 0) {
+      // All used, fall back to any candidate
+      return candidateIndices[0];
+    }
+    if (available.length === 1) {
+      return available[0];
+    }
+
+    // Check context hashes to find the best match
+    const scores = available.map(idx => {
+      let score = 0;
+
+      // Find previous non-blank code line
+      let prevIdx = -1;
+      for (let j = idx - 1; j >= 0; j--) {
+        if (lines[j].trim()) {
+          prevIdx = j;
+          break;
+        }
+      }
+
+      // Find next non-blank code line
+      let nextIdx = -1;
+      for (let j = idx + 1; j < lines.length; j++) {
+        if (lines[j].trim()) {
+          nextIdx = j;
+          break;
+        }
+      }
+
+      // Score based on matching context
+      if (comment.prevHash && prevIdx >= 0) {
+        const prevHash = hashLine(lines[prevIdx], 0);
+        if (prevHash === comment.prevHash) score += 10;
+      }
+
+      if (comment.nextHash && nextIdx >= 0) {
+        const nextHash = hashLine(lines[nextIdx], 0);
+        if (nextHash === comment.nextHash) score += 10;
+      }
+
+      return { idx, score };
+    });
+
+    // Sort by score (highest first), then by index (to maintain order)
+    scores.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.idx - b.idx;
+    });
+
+    return scores[0].idx;
+  };
+
   // Separate comments by type and sort by originalLine
   const blockComments = comments.filter(c => c.type === "block").sort((a, b) => {
     const aLine = a.block[0]?.originalLine || 0;
@@ -221,18 +322,17 @@ function injectComments(cleanText, comments) {
   });
   const inlineComments = comments.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
 
-  // Track which occurrence of each duplicate line we've used
-  const anchorUsageCount = new Map();
+  // Track which indices we've already used
+  const usedIndices = new Set();
 
   // Build maps: line index -> comment
   const blockMap = new Map();
   for (const block of blockComments) {
     const indices = lineHashToIndices.get(block.anchor);
     if (indices && indices.length > 0) {
-      const usageCount = anchorUsageCount.get(block.anchor) || 0;
-      const targetIndex = indices[Math.min(usageCount, indices.length - 1)];
-      anchorUsageCount.set(block.anchor, usageCount + 1);
-      
+      const targetIndex = findBestMatch(block, indices, usedIndices);
+      usedIndices.add(targetIndex);
+
       if (!blockMap.has(targetIndex)) {
         blockMap.set(targetIndex, []);
       }
@@ -244,10 +344,9 @@ function injectComments(cleanText, comments) {
   for (const inline of inlineComments) {
     const indices = lineHashToIndices.get(inline.anchor);
     if (indices && indices.length > 0) {
-      const usageCount = anchorUsageCount.get(inline.anchor) || 0;
-      const targetIndex = indices[Math.min(usageCount, indices.length - 1)];
-      anchorUsageCount.set(inline.anchor, usageCount + 1);
-      
+      const targetIndex = findBestMatch(inline, indices, usedIndices);
+      usedIndices.add(targetIndex);
+
       inlineMap.set(targetIndex, inline);
     }
   }
