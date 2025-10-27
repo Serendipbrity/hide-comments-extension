@@ -636,13 +636,22 @@ async function activate(context) {
     } else {
       // File is clean -> restore comments from .vcm
       try {
+        // Try to read existing .vcm file
         const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
         newText = injectComments(text, vcmData.comments || []);
         vscode.window.showInformationMessage("VCM: Comments restored from .vcm");
       } catch {
-        vscode.window.showErrorMessage("VCM: No .vcm data found — save once with comments first.");
-        vcmSyncEnabled = true;
-        return;
+        // No .vcm file exists yet — create one now
+        await saveVCM(doc);
+        try {
+          const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
+          newText = injectComments(text, vcmData.comments || []);
+          vscode.window.showInformationMessage("VCM: Created and restored new .vcm data");
+        } catch {
+          vscode.window.showErrorMessage("VCM: Could not create .vcm data — save the file once with comments.");
+          vcmSyncEnabled = true;
+          return;
+        }
       }
     }
 
