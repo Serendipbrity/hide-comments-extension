@@ -16,10 +16,46 @@ let vcmEditor;           // Reference to the VCM split view editor
 let tempUri;             // URI for the temporary VCM view document
 let scrollListener;      // Event listener for cursor movement between panes
 let vcmSyncEnabled = true; // Flag to temporarily disable .vcm file updates during toggles
+let isCommentedMap = new Map(); // Track state: true = comments visible, false = clean mode (comments hidden)
+let justInjectedFromVCM = new Set(); // Track files that just had VCM comments injected (don't re-extract)
 
 // -----------------------------------------------------------------------------
 // Utility Helpers
 // -----------------------------------------------------------------------------
+
+// Comment markers per file type - single source of truth for all languages
+const COMMENT_MARKERS = {
+  'py': ['#'],
+  'python': ['#'],
+  'pyx': ['#'],
+  'pyi': ['#'],
+  'js': ['//'],
+  'jsx': ['//'],
+  'ts': ['//'],
+  'tsx': ['//'],
+  'java': ['//'],
+  'c': ['//'],
+  'cpp': ['//'],
+  'h': ['//'],
+  'hpp': ['//'],
+  'cs': ['//'],
+  'go': ['//'],
+  'rs': ['//'],
+  'swift': ['//'],
+  'sql': ['--'],
+  'lua': ['--'],
+  'm': ['%'],
+  'matlab': ['%'],
+  'asm': [';'],
+  's': [';']
+};
+
+// Get comment markers for a specific file based on extension
+// Returns array of comment marker strings for the file type
+function getCommentMarkersForFile(filePath) {
+  const ext = filePath.split('.').pop().toLowerCase();
+  return COMMENT_MARKERS[ext] || ['#', '//', '--', '%', ';']; // Default: support all common markers
+}
 
 // Content provider for the custom "vcm-view:" URI scheme
 // This allows us to display virtual documents in VS Code without creating real files
@@ -50,6 +86,148 @@ function hashLine(line, lineIndex) {
     .substring(0, 8);
 }
 
+// Merge new comments with existing VCM comments using hash matching
+// This is used when toggling from clean mode to commented mode
+// Returns: merged array of comments with new text prepended to existing
+function mergeCommentsWithVCM(newComments, existingComments) {
+  // Build a map of anchor hash -> array of existing comments (handles duplicate anchors)
+  const existingByAnchor = new Map();
+  for (const old of existingComments) {
+    if (!existingByAnchor.has(old.anchor)) {
+      existingByAnchor.set(old.anchor, []);
+    }
+    existingByAnchor.get(old.anchor).push(old);
+  }
+
+  // Helper: Find best matching existing comment using context hashes
+  const findBestExistingMatch = (newComment, candidates) => {
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    // Score each candidate based on context hash matching
+    const scores = candidates.map(existing => {
+      let score = 0;
+
+      // Match prevHash
+      if (newComment.prevHash && existing.prevHash) {
+        if (newComment.prevHash === existing.prevHash) score += 10;
+      }
+
+      // Match nextHash
+      if (newComment.nextHash && existing.nextHash) {
+        if (newComment.nextHash === existing.nextHash) score += 10;
+      }
+
+      return { existing, score };
+    });
+
+    // Sort by score (highest first)
+    scores.sort((a, b) => b.score - a.score);
+
+    return scores[0].existing;
+  };
+
+  // Track which existing comments have been matched
+  const usedExisting = new Set();
+
+  // Process new comments and merge with existing BY MODIFYING IN PLACE
+  for (const newC of newComments) {
+    const candidates = existingByAnchor.get(newC.anchor) || [];
+    const availableCandidates = candidates.filter(c => !usedExisting.has(c));
+
+    if (availableCandidates.length > 0) {
+      // Find the best matching existing comment using context hashes
+      const existing = findBestExistingMatch(newC, availableCandidates);
+      usedExisting.add(existing);
+
+      if (newC.type === "block" && existing.type === "block") {
+        // Prepend new block lines ABOVE existing block (modify in place)
+        const existingTexts = existing.block.map(b => b.text?.trim());
+
+        // Only add new block lines that don't already exist
+        const uniqueNewBlocks = newC.block.filter(nb =>
+          !existingTexts.includes(nb.text?.trim())
+        );
+
+        if (uniqueNewBlocks.length > 0) {
+          existing.block = [...uniqueNewBlocks, ...existing.block];
+        }
+      } else if (newC.type === "inline" && existing.type === "inline") {
+        // Check if new text already exists in the existing text
+        const newText = newC.text || "";
+        const existingText = existing.text || "";
+
+        if (!existingText.includes(newText.trim())) {
+          // Prepend new comment to existing comment (both include markers)
+          // Example: "  # new" + "  # old" = "  # new  # old"
+          existing.text = newText + existingText;
+        }
+      }
+    }
+  }
+
+  // Return existing comments in their ORIGINAL ORDER (not reordered)
+  return existingComments;
+}
+
+// Detect initial state: are comments visible or hidden?
+// Returns: true if comments are visible (isCommented), false if in clean mode
+async function detectInitialMode(doc, vcmFileUri, vcmDir) {
+  const relativePath = vscode.workspace.asRelativePath(doc.uri);
+  const vcmPath = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+  try {
+    // VCM exists - check if first 5-10 comments from VCM match the file
+    const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmPath)).toString());
+    const comments = vcmData.comments || [];
+
+    if (comments.length === 0) {
+      return true; // No comments in VCM, assume commented mode
+    }
+
+    const lines = doc.getText().split('\n');
+    const checkCount = Math.min(10, comments.length);
+
+    // Check if first N comments exist in the file
+    for (let i = 0; i < checkCount; i++) {
+      const comment = comments[i];
+      const lineIndex = comment.originalLine;
+
+      if (lineIndex >= lines.length) continue;
+
+      const currentLine = lines[lineIndex];
+      const commentText = comment.type === 'inline'
+        ? comment.text
+        : (comment.block && comment.block[0] ? comment.block[0].text : '');
+
+      if (commentText && !currentLine.includes(commentText)) {
+        return false; // Comment not found - we're in clean mode
+      }
+    }
+
+    return true; // All checked comments found - we're in commented mode
+
+  } catch {
+    // No VCM exists - check if the actual file has comments
+    const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+    const lines = doc.getText().split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      for (const marker of commentMarkers) {
+        if (trimmed.startsWith(marker)) {
+          return true; // File has comments - isCommented = true
+        }
+      }
+    }
+
+    return false; // No comments found - isCommented = false
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Comment Extraction + Injection
 // -----------------------------------------------------------------------------
@@ -69,23 +247,8 @@ function extractComments(text, filePath) {
   const comments = [];      // Final array of all extracted comments
   let commentBuffer = [];   // Temporary buffer for consecutive comment lines
 
-  // Detect language from file extension to use correct comment markers
-  const ext = filePath.split('.').pop().toLowerCase();
-  let commentMarkers;
-  
-  if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
-    commentMarkers = ['#'];  // Python only uses #
-  } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
-    commentMarkers = ['//'];  // C-style languages
-  } else if (['sql', 'lua'].includes(ext)) {
-    commentMarkers = ['--'];  // SQL/Lua style
-  } else if (['m', 'matlab'].includes(ext)) {
-    commentMarkers = ['%'];  // MATLAB style
-  } else if (['asm', 's'].includes(ext)) {
-    commentMarkers = [';'];  // Assembly style
-  } else {
-    commentMarkers = ['#', '//', '--', '%', ';'];  // Default: support all
-  }
+  // Get comment markers for this file type from our centralized config
+  const commentMarkers = getCommentMarkersForFile(filePath);
 
   // Build regex pattern for this file type
   const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
@@ -131,65 +294,38 @@ function extractComments(text, filePath) {
 
     // CASE 1: This line is a standalone comment
     if (isComment(line)) {
-      // Extract comment parts: indent, marker, and text
-      const match = line.match(new RegExp(`^(\\s*)(${markerPattern})\\s?(.*?)$`));
-      if (match) {
-        commentBuffer.push({
-          text: match[3],        // The actual comment text
-          indent: match[1],      // Whitespace before the comment marker
-          marker: match[2],      // The comment symbol
-          originalLine: i,       // 0-based line index
-        });
-      }
+      // Store the ENTIRE line as-is (includes indent, marker, spacing, text, trailing spaces)
+      commentBuffer.push({
+        text: line,           // Full line exactly as it appears
+        originalLine: i,      // 0-based line index
+      });
       continue; // Move to next line, stay in comment-gathering mode
     }
 
-    // CASE 2: This line is code - check for inline comment
-    // Find the last occurrence of a comment marker that's not in a string
-    // We scan from right to left to find the actual comment marker
-    let inlineComment = null;
-    for (const marker of commentMarkers) {
-      const markerIndex = line.lastIndexOf(marker);
-      if (markerIndex === -1) continue;
-      
-      // Check if marker is preceded by whitespace (not part of string/expression)
-      const beforeMarker = line.substring(0, markerIndex);
-      if (beforeMarker.match(/\s$/) && beforeMarker.trim()) {
-        // This looks like a real comment
-        const codePart = beforeMarker.trimEnd();
-        const commentText = line.substring(markerIndex + marker.length).trim();
+    // CASE 2: This line is code - check for inline comment(s)
+    // Find the first comment marker and extract everything after it as ONE combined comment
+    let inlineRegex = new RegExp(`(\\s+)(${markerPattern})`, "");
+    let match = line.match(inlineRegex);
 
-        // Calculate the spacing between code and comment marker
-        const spacing = beforeMarker.length - codePart.length;
-        // Extra check for // in expressions (skip if looks like division)
-        if (marker === '//' && codePart.match(/[\w\]\)]$/) && commentText.match(/^\d/)) {
-          continue; // Likely division operator
-        }
-        
-        inlineComment = {
-          codePart,
-          marker,
-          commentText,
-          spacing  // Store the original spacing
-        };
-        break;
-      }
-    }
-    
-    if (inlineComment) {
-      // Store context: previous and next code lines
+    if (match) {
+      // Extract everything from the first comment marker onwards (all inline comments combined)
+      const commentStartIndex = match.index;
+      const fullComment = line.substring(commentStartIndex);
+
+      // Context lines
       const prevIdx = findPrevCodeLine(i);
       const nextIdx = findNextCodeLine(i);
 
+      // Hash only the code portion before the first inline comment marker
+      const anchorBase = line.substring(0, commentStartIndex).trimEnd();
+
       comments.push({
         type: "inline",
-        anchor: hashLine(inlineComment.codePart, 0), // Just content hash
+        anchor: hashLine(anchorBase, 0),
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         originalLine: i,
-        text: inlineComment.commentText,
-        marker: inlineComment.marker,
-        spacing: inlineComment.spacing,  // Store the original spacing
+        text: fullComment,  // Store ALL inline comments as one combined text
       });
     }
 
@@ -349,9 +485,11 @@ function injectComments(cleanText, comments) {
     const indices = lineHashToIndices.get(inline.anchor);
     if (indices && indices.length > 0) {
       const targetIndex = findBestMatch(inline, indices, usedIndices);
-      usedIndices.add(targetIndex);
+      // DON'T mark as used for inline comments - multiple inlines can be on same line!
+      // usedIndices.add(targetIndex);
 
-      inlineMap.set(targetIndex, inline);
+      if (!inlineMap.has(targetIndex)) inlineMap.set(targetIndex, []);
+      inlineMap.get(targetIndex).push(inline);
     }
   }
 
@@ -363,8 +501,8 @@ function injectComments(cleanText, comments) {
     if (blocks) {
       for (const block of blocks) {
         for (const c of block.block) {
-          // Reconstruct: indent + marker + text (text already has space if needed)
-          result.push(`${c.indent || ""}${c.marker || "//"}${c.text ? " " + c.text : ""}`);
+          // Just push the full text as-is (includes indent, marker, spacing, text)
+          result.push(c.text);
         }
       }
     }
@@ -373,13 +511,11 @@ function injectComments(cleanText, comments) {
     let line = lines[i];
     
     // STEP 3: Check if this line has an inline comment
-    const inline = inlineMap.get(i);
-    if (inline) {
-      // Append the inline comment with original spacing (default to 2 spaces if not stored)
-      const spacing = " ".repeat(inline.spacing || 2);
-      line += `${spacing}${inline.marker || "//"}${inline.text ? " " + inline.text : ""}`;
+    const inlines = inlineMap.get(i);
+    if (inlines && inlines.length > 0) {
+      // Should only be one inline comment per line (contains all combined comments)
+      line += inlines[0].text;
     }
-
     result.push(line);
   }
 
@@ -395,23 +531,8 @@ function injectComments(cleanText, comments) {
 // 4. Handle strings properly - don't remove comment markers inside strings
 // 5. Language-aware: only remove markers appropriate for the file type
 function stripComments(text, filePath) {
-  // Detect language from file extension (same logic as extractComments)
-  const ext = filePath.split('.').pop().toLowerCase();
-  let commentMarkers;
-
-  if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
-    commentMarkers = ['#'];  // Python only uses #
-  } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
-    commentMarkers = ['//'];  // C-style languages
-  } else if (['sql', 'lua'].includes(ext)) {
-    commentMarkers = ['--'];  // SQL/Lua style
-  } else if (['m', 'matlab'].includes(ext)) {
-    commentMarkers = ['%'];  // MATLAB style
-  } else if (['asm', 's'].includes(ext)) {
-    commentMarkers = [';'];  // Assembly style
-  } else {
-    commentMarkers = ['#', '//', '--', '%', ';'];  // Default: support all
-  }
+  // Get comment markers for this file type from our centralized config
+  const commentMarkers = getCommentMarkersForFile(filePath);
 
   // Build regex pattern for this file type
   const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
@@ -520,39 +641,94 @@ async function activate(context) {
     vscode.workspace.registerTextDocumentContentProvider("vcm-view", provider)
   );
 
-  // ---------------------------------------------------------------------------
-  // SAVE VCM HANDLER
-  // ---------------------------------------------------------------------------
-  // Extracts comments from a document and saves them to .vcm/<file>.vcm.json
-  // This creates a persistent mirror of the comment structure
+  // ============================================================================
+  // saveVCM()
+  // ============================================================================
+  // Handles saving the .vcm mirror file for the currently open document.
+  // Logic:
+  //   - If the file contains existing VCM comments (isCommented = true):
+  //         → overwrite the .vcm.json with the current comment state.
+  //   - If the file is clean (isCommented = false):
+  //         → prepend new comments to existing ones where possible,
+  //           without overwriting anything in the .vcm.json.
+  //
+  // This function is always called by the save watcher (liveSync included).
+  // It auto-detects commented vs. clean by comparing line hashes against
+  // a small sample of known VCM anchors (first/last 5) for speed.
+  // ============================================================================
   async function saveVCM(doc) {
-    // Only process real files (not virtual documents or .vcm files themselves)
     if (doc.uri.scheme !== "file") return;
     if (doc.uri.path.includes("/.vcm/")) return;
     if (doc.languageId === "json") return;
 
-    const text = doc.getText();
-    const comments = extractComments(text, doc.uri.path);
+    // If we just injected comments from VCM, don't re-extract and save
+    // (this prevents splitting combined inline comments back into separate objects)
+    if (justInjectedFromVCM.has(doc.uri.fsPath)) {
+      justInjectedFromVCM.delete(doc.uri.fsPath);
+      return;
+    }
 
-    // Create .vcm file path mirroring source file structure
-    // Example: src/app.py -> .vcm/src/app.py.vcm.json
+    const text = doc.getText();
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
-    // Ensure nested directories exist
-    const pathParts = relativePath.split(/[\\/]/);
-    if (pathParts.length > 1) {
-      const vcmSubdir = vscode.Uri.joinPath(vcmDir, pathParts.slice(0, -1).join("/"));
-      await vscode.workspace.fs.createDirectory(vcmSubdir).catch(() => {});
+    // Extract all current comments from the document
+    const currentComments = extractComments(text, doc.uri.path);
+
+    // Load existing VCM data (if any)
+    let existingComments = [];
+    try {
+      const raw = (await vscode.workspace.fs.readFile(vcmFileUri)).toString();
+      const vcmData = JSON.parse(raw);
+      existingComments = vcmData.comments || [];
+    } catch {
+      // No .vcm yet — nothing to merge
+      existingComments = [];
     }
 
-    // Save comment data as JSON
+    // Get the current mode from our state map
+    const isCommented = isCommentedMap.get(doc.uri.fsPath);
+
+    // ------------------------------------------------------------------------
+    // Merge Strategy
+    // ------------------------------------------------------------------------
+    let finalComments;
+
+    if (isCommented) {
+      // Commented mode:
+      //   → The user is editing the commented version.
+      //   → Replace entire VCM with what's currently visible.
+      finalComments = currentComments;
+
+    } else {
+      // Clean mode:
+      //   → The user is editing the clean version WITHOUT comments visible.
+      //   → Merge any NEW comments they typed with existing VCM using hash matching.
+      //   → Store full comments exactly as typed (with all spacing, markers, text).
+
+      finalComments = mergeCommentsWithVCM(currentComments, existingComments);
+    }
+
+    // ------------------------------------------------------------------------
+    // Save final .vcm.json data
+    // ------------------------------------------------------------------------
     const vcmData = {
       file: relativePath,
       lastModified: new Date().toISOString(),
-      comments,  // Array of comment objects from extractComments()
+      comments: finalComments,
     };
 
+    // Ensure directories exist
+    const pathParts = relativePath.split(/[\\/]/);
+    if (pathParts.length > 1) {
+      const vcmSubdir = vscode.Uri.joinPath(
+        vcmDir,
+        pathParts.slice(0, -1).join("/")
+      );
+      await vscode.workspace.fs.createDirectory(vcmSubdir).catch(() => {});
+    }
+
+    // Write file back to disk
     await vscode.workspace.fs.writeFile(
       vcmFileUri,
       Buffer.from(JSON.stringify(vcmData, null, 2), "utf8")
@@ -567,6 +743,7 @@ async function activate(context) {
   // vcmSyncEnabled flag prevents infinite loops during toggles
   const saveWatcher = vscode.workspace.onDidSaveTextDocument(async (doc) => {
     if (!vcmSyncEnabled) return;  // Skip if we're in the middle of a toggle
+    // saveVCM() will check if file is in clean mode internally
     await saveVCM(doc);
   });
   context.subscriptions.push(saveWatcher);
@@ -577,6 +754,7 @@ async function activate(context) {
     let writeTimeout;
     const changeWatcher = vscode.workspace.onDidChangeTextDocument((e) => {
       if (!vcmSyncEnabled) return;
+      // saveVCM() will check if file is in clean mode internally
       clearTimeout(writeTimeout);
       writeTimeout = setTimeout(() => saveVCM(e.document), 2000);
     });
@@ -597,39 +775,24 @@ async function activate(context) {
 
     // Disable .vcm sync during toggle to prevent overwriting
     vcmSyncEnabled = false;
-    
+
     const doc = editor.document;
     const text = doc.getText();
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
-    // Detect language-specific comment markers
-    const ext = doc.uri.path.split('.').pop().toLowerCase();
-    let commentMarkers;
-
-    if (['py', 'python', 'pyx', 'pyi'].includes(ext)) {
-      commentMarkers = ['#'];
-    } else if (['js', 'jsx', 'ts', 'tsx', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'swift'].includes(ext)) {
-      commentMarkers = ['//'];
-    } else if (['sql', 'lua'].includes(ext)) {
-      commentMarkers = ['--'];
-    } else if (['m', 'matlab'].includes(ext)) {
-      commentMarkers = ['%'];
-    } else if (['asm', 's'].includes(ext)) {
-      commentMarkers = [';'];
-    } else {
-      commentMarkers = ['#', '//', '--', '%', ';'];
+    // Detect initial state if not already set
+    if (!isCommentedMap.has(doc.uri.fsPath)) {
+      const initialState = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      isCommentedMap.set(doc.uri.fsPath, initialState);
     }
 
-    // Build language-specific comment detection pattern
-    const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-    const commentPattern = new RegExp(`(^\\s*(${markerPattern})|\\s+(${markerPattern}))`, 'm');
-
-    // Check if current file has any comments
-    const hasComments = commentPattern.test(text);
+    // Get current state
+    const currentIsCommented = isCommentedMap.get(doc.uri.fsPath);
     let newText;
 
-    if (hasComments) {
+    if (currentIsCommented === true) {
+      // Currently in commented mode -> switch to clean mode (hide comments)
       // Ensure a .vcm file exists before stripping
       try {
         await vscode.workspace.fs.stat(vcmFileUri);
@@ -637,23 +800,70 @@ async function activate(context) {
         // No .vcm yet — extract and save before removing comments
         await saveVCM(doc);
       }
-      // File has comments -> strip them
+
+      // If liveSync is disabled, always update manually
+      const config = vscode.workspace.getConfiguration("vcm");
+      const liveSync = config.get("liveSync", false);
+      if (!liveSync) {
+        await saveVCM(doc);
+      }
+
+      // Strip comments to show clean version
       newText = stripComments(text, doc.uri.path);
-      vscode.window.showInformationMessage("VCM: Comments hidden (clean view)");
+      // Mark this file as now in clean mode
+      isCommentedMap.set(doc.uri.fsPath, false);
+      vscode.window.showInformationMessage("VCM: Switched to clean mode (comments hidden)");
     } else {
-      // File is clean -> restore comments from .vcm
+      // Currently in clean mode -> switch to commented mode (show comments)
       try {
         // Try to read existing .vcm file
         const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
-        newText = injectComments(text, vcmData.comments || []);
-        vscode.window.showInformationMessage("VCM: Comments restored from .vcm");
+        const existingComments = vcmData.comments || [];
+
+        // Extract any NEW comments the user added in clean mode
+        const newComments = extractComments(text, doc.uri.path);
+
+        // Merge new comments with existing VCM using hash matching
+        const mergedComments = mergeCommentsWithVCM(newComments, existingComments);
+
+        // Get clean code (strip all comments)
+        const cleanText = stripComments(text, doc.uri.path);
+
+        // Inject merged comments into clean code
+        newText = injectComments(cleanText, mergedComments);
+
+        // Save the merged VCM before toggling
+        const updatedVcmData = {
+          file: relativePath,
+          lastModified: new Date().toISOString(),
+          comments: mergedComments,
+        };
+        await vscode.workspace.fs.writeFile(
+          vcmFileUri,
+          Buffer.from(JSON.stringify(updatedVcmData, null, 2), "utf8")
+        );
+
+        // Mark this file as now in commented mode
+        isCommentedMap.set(doc.uri.fsPath, true);
+
+        // Mark that we just injected from VCM - don't re-extract on next save
+        justInjectedFromVCM.add(doc.uri.fsPath);
+
+        vscode.window.showInformationMessage("VCM: Switched to commented mode (comments visible)");
       } catch {
         // No .vcm file exists yet — create one now
+        isCommentedMap.set(doc.uri.fsPath, true);
         await saveVCM(doc);
         try {
           const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
-          newText = injectComments(text, vcmData.comments || []);
-          vscode.window.showInformationMessage("VCM: Created and restored new .vcm data");
+          // Strip comments before injecting
+          const cleanText = stripComments(text, doc.uri.path);
+          newText = injectComments(cleanText, vcmData.comments || []);
+
+          // Mark that we just injected from VCM - don't re-extract on next save
+          justInjectedFromVCM.add(doc.uri.fsPath);
+
+          vscode.window.showInformationMessage("VCM: Created new .vcm and switched to commented mode");
         } catch {
           vscode.window.showErrorMessage("VCM: Could not create .vcm data — save the file once with comments.");
           vcmSyncEnabled = true;
@@ -667,7 +877,7 @@ async function activate(context) {
     edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), newText);
     await vscode.workspace.applyEdit(edit);
     await vscode.commands.executeCommand("workbench.action.files.save");
-    
+
     // Re-enable sync after a delay to ensure save completes
     setTimeout(() => (vcmSyncEnabled = true), 800);
   });
