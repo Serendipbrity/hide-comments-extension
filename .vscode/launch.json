@@ -6,7 +6,10 @@
       "type": "extensionHost",
       "request": "launch",
       "runtimeExecutable": "${execPath}",
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "/Users/brittanicourt/safeDesktop/Scrap"  // the folder to open
+      ],
       "outFiles": ["${workspaceFolder}/**/*.js"]
     }
   ]
