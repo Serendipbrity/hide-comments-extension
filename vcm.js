@@ -500,7 +500,20 @@ function injectComments(cleanText, comments) {
     const blocks = blockMap.get(i);
     if (blocks) {
       for (const block of blocks) {
-        for (const c of block.block) {
+        // Combine text_cleanMode (if it's a block array) and block
+        let allBlockLines = [];
+
+        // text_cleanMode for blocks contains the block array
+        if (block.text_cleanMode && Array.isArray(block.text_cleanMode)) {
+          allBlockLines.push(...block.text_cleanMode);
+        }
+
+        // Add original block lines
+        if (block.block) {
+          allBlockLines.push(...block.block);
+        }
+
+        for (const c of allBlockLines) {
           // Just push the full text as-is (includes indent, marker, spacing, text)
           result.push(c.text);
         }
@@ -509,12 +522,28 @@ function injectComments(cleanText, comments) {
 
     // STEP 2: Add the code line itself
     let line = lines[i];
-    
+
     // STEP 3: Check if this line has an inline comment
     const inlines = inlineMap.get(i);
     if (inlines && inlines.length > 0) {
       // Should only be one inline comment per line (contains all combined comments)
-      line += inlines[0].text;
+      const inline = inlines[0];
+      // Combine text_cleanMode (string) and text
+      let commentText = "";
+
+      // text_cleanMode for inline comments is a string
+      if (inline.text_cleanMode && typeof inline.text_cleanMode === 'string') {
+        commentText += inline.text_cleanMode;
+      }
+
+      // Add original text
+      if (inline.text) {
+        commentText += inline.text;
+      }
+
+      if (commentText) {
+        line += commentText;
+      }
     }
     result.push(line);
   }
@@ -661,11 +690,11 @@ async function activate(context) {
     if (doc.uri.path.includes("/.vcm/")) return;
     if (doc.languageId === "json") return;
 
-    // If we just injected comments from VCM, don't re-extract and save
-    // (this prevents splitting combined inline comments back into separate objects)
-    if (justInjectedFromVCM.has(doc.uri.fsPath)) {
+    // Check if we just injected comments from VCM
+    // (this flag prevents re-extracting immediately after injection in clean mode)
+    const wasJustInjected = justInjectedFromVCM.has(doc.uri.fsPath);
+    if (wasJustInjected) {
       justInjectedFromVCM.delete(doc.uri.fsPath);
-      return;
     }
 
     const text = doc.getText();
@@ -687,7 +716,13 @@ async function activate(context) {
     }
 
     // Get the current mode from our state map
-    const isCommented = isCommentedMap.get(doc.uri.fsPath);
+    let isCommented = isCommentedMap.get(doc.uri.fsPath);
+
+    // If state is not set, initialize it by detecting the mode
+    if (isCommented === undefined) {
+      isCommented = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      isCommentedMap.set(doc.uri.fsPath, isCommented);
+    }
 
     // ------------------------------------------------------------------------
     // Merge Strategy
@@ -698,15 +733,76 @@ async function activate(context) {
       // Commented mode:
       //   → The user is editing the commented version.
       //   → Replace entire VCM with what's currently visible.
+      //   → Always extract current state to detect deletions immediately.
+
       finalComments = currentComments;
 
     } else {
       // Clean mode:
       //   → The user is editing the clean version WITHOUT comments visible.
-      //   → Merge any NEW comments they typed with existing VCM using hash matching.
-      //   → Store full comments exactly as typed (with all spacing, markers, text).
+      //   → VCM comments (with `text`) are preserved as-is (hidden from view).
+      //   → New comments typed in clean mode go into `text_cleanMode`.
+      //   → Livesync only touches `text_cleanMode`, never `text`.
 
-      finalComments = mergeCommentsWithVCM(currentComments, existingComments);
+      // If we just injected from VCM, skip processing to avoid re-extracting
+      if (wasJustInjected) {
+        finalComments = existingComments;
+      } else {
+        // Build a map of existing comments by anchor for matching
+        const existingByAnchor = new Map();
+        for (const existing of existingComments) {
+          const key = `${existing.type}:${existing.anchor}`;
+          if (!existingByAnchor.has(key)) {
+            existingByAnchor.set(key, []);
+          }
+          existingByAnchor.get(key).push(existing);
+        }
+
+        // Process current comments (typed in clean mode)
+        for (const current of currentComments) {
+          const key = `${current.type}:${current.anchor}`;
+          const candidates = existingByAnchor.get(key) || [];
+
+          if (candidates.length > 0) {
+            // Found matching existing comment - update its text_cleanMode
+            const existing = candidates[0]; // Use first match (could improve with context matching)
+
+            if (current.type === "inline") {
+              existing.text_cleanMode = current.text;
+            } else if (current.type === "block") {
+              // For block comments, store the block array in text_cleanMode
+              existing.text_cleanMode = current.block;
+            }
+          } else {
+            // No existing comment - create new one with text_cleanMode
+            const newComment = { ...current };
+            if (current.type === "inline") {
+              newComment.text_cleanMode = current.text;
+              delete newComment.text;
+            } else if (current.type === "block") {
+              // For block comments, store the block array in text_cleanMode
+              newComment.text_cleanMode = current.block;
+              delete newComment.block;
+            }
+            existingComments.push(newComment);
+          }
+        }
+
+        // Remove text_cleanMode from comments that are no longer present
+        for (const existing of existingComments) {
+          const key = `${existing.type}:${existing.anchor}`;
+          const stillExists = currentComments.some(c =>
+            `${c.type}:${c.anchor}` === key
+          );
+
+          if (!stillExists) {
+            // User deleted this comment in clean mode
+            existing.text_cleanMode = null;
+          }
+        }
+
+        finalComments = existingComments;
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -820,11 +916,23 @@ async function activate(context) {
         const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
         const existingComments = vcmData.comments || [];
 
-        // Extract any NEW comments the user added in clean mode
-        const newComments = extractComments(text, doc.uri.path);
+        // Merge text_cleanMode into text/block and clear text_cleanMode
+        const mergedComments = existingComments.map(comment => {
+          const merged = { ...comment };
 
-        // Merge new comments with existing VCM using hash matching
-        const mergedComments = mergeCommentsWithVCM(newComments, existingComments);
+          if (comment.text_cleanMode) {
+            if (comment.type === "inline") {
+              // For inline: text_cleanMode is a string, prepend to text
+              merged.text = (comment.text_cleanMode || "") + (comment.text || "");
+            } else if (comment.type === "block") {
+              // For block: text_cleanMode is a block array, prepend to block
+              merged.block = [...(comment.text_cleanMode || []), ...(comment.block || [])];
+            }
+            merged.text_cleanMode = null;
+          }
+
+          return merged;
+        });
 
         // Get clean code (strip all comments)
         const cleanText = stripComments(text, doc.uri.path);
