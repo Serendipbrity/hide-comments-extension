@@ -1,61 +1,70 @@
 {
-  "name": "vcm-extension",
-  "displayName": "VCM - Versioned Comment Manager",
+  "name": "vcm-view-comments-mirror",
+  "displayName": "VCM - View Comments Mirror",
   "version": "0.1.0",
-  "publisher": "Brittani Court",
+  "publisher": "brittanicourt",
   "description": "Invisible documentation layer for code - keep repos clean, comments versioned",
-  "engines": {
-    "vscode": "^1.70.0"
-  },
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./vcm-extension.js",
+  "main": "./vcm.js",
+  "engines": { "vscode": "^1.90.0" },
   "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "VCM Settings",
+      "properties": {
+        "vcm-view-comments-mirror.autoSplitView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open the comments view in a split editor on the right when toggled."
+        },
+        "vcm-view-comments-mirror.liveSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-save .vcm files while typing (2-second debounce)."
+        },
+        "vcm-view-comments-mirror.storageMode": {
+          "enum": ["clean-repo", "documented-repo"],
+          "default": "documented-repo",
+          "description": "clean-repo: files are saved without comments, toggle shows comments.\ndocumented-repo: files are saved with comments, toggle shows clean version."
+        }
+      }
+    },
     "commands": [
       {
-        "command": "vcm.toggleCurrentFileComments",
+        "command": "vcm-view-comments-mirror.toggleCurrentFileComments",
         "title": "VCM: --- Current File: --- View/Hide Comments"
       },
       {
-        "command": "vcm.toggleSplitViewComments",
+        "command": "vcm-view-comments-mirror.toggleSplitViewComments",
         "title": "VCM: --- Split View: --- View/Hide Comments"
       },
       {
-        "command": "vcm.toggleLocalComments",
+        "command": "vcm-view-comments-mirror.toggleLocalComments",
         "title": "VCM: Hide/Show Local Comments (Repo-Wide)"
       }
     ],
     "keybindings": [
       {
-        "command": "vcm.toggleComments",
-        "key": "ctrl+shift+c",
-        "mac": "cmd+shift+c",
+        "command": "vcm-view-comments-mirror.toggleSplitViewComments",
+        "key": "ctrl+alt+v+c",
+        "mac": "cmd+alt+v+c",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "vcm-view-comments-mirror.toggleCurrentFileComments",
+        "key": "ctrl+v+c",
+        "mac": "cmd+v+c",
         "when": "editorTextFocus"
       }
-    ],
-    "configuration": {
-      "type": "object",
-      "title": "VCM Settings",
-      "properties": {
-        "vcm.autoSplitView": {
-          "type": "boolean",
-          "default": true,
-          "description": "Open the comments view in a split editor on the right"
-        },
-        "vcm.liveSync": {
-          "type": "boolean",
-          "default": false,
-          "description": "Auto-save .vcm files while typing (2 second debounce)"
-        }
-      }
-    }
+    ]
   },
   "categories": ["Other"],
   "keywords": ["comments", "documentation", "code-review", "clean-code"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/vcm-extension"
+    "url": "https://github.com/Serendipbrity/vcm-view-comments-mirror"
   },
   "license": "MIT"
 }

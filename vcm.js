@@ -769,7 +769,7 @@ async function activate(context) {
   // 1. If file has comments: strip them and show clean version
   // 2. If file is clean: restore comments from .vcm file
   
-  const toggleCurrentFileComments = vscode.commands.registerCommand("vcm.toggleCurrentFileComments", async () => {
+  const toggleCurrentFileComments = vscode.commands.registerCommand("vcm-view-comments-mirror.toggleCurrentFileComments", async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
@@ -890,7 +890,7 @@ async function activate(context) {
   // Currently configured: source (with comments) -> right pane (without comments)
   // TODO: Make this configurable to show comments on right instead
   
-  const toggleSplitView = vscode.commands.registerCommand("vcm.toggleSplitViewComments", async () => {
+  const toggleSplitView = vscode.commands.registerCommand("vcm-view-comments-mirror.toggleSplitViewComments", async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
 
