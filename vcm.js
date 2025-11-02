@@ -15,6 +15,7 @@ let vcmStatus;           // Status bar item showing VCM state
 let vcmEditor;           // Reference to the VCM split view editor
 let tempUri;             // URI for the temporary VCM view document
 let scrollListener;      // Event listener for cursor movement between panes
+let sourceDocUri;        // Track which source document has the split view open
 let vcmSyncEnabled = true; // Flag to temporarily disable .vcm file updates during toggles
 let isCommentedMap = new Map(); // Track state: true = comments visible, false = clean mode (comments hidden)
 let justInjectedFromVCM = new Set(); // Track files that just had VCM comments injected (don't re-extract)
@@ -63,16 +64,19 @@ function getCommentMarkersForFile(filePath) {
 class VCMContentProvider {
   constructor() {
     this.content = new Map(); // Map of URI -> document content
+    this._onDidChange = new vscode.EventEmitter();
+    this.onDidChange = this._onDidChange.event;
   }
-  
+
   // Called by VS Code when it needs to display a vcm-view: document
   provideTextDocumentContent(uri) {
     return this.content.get(uri.toString()) || "";
   }
-  
-  // Update the content for a specific URI
+
+  // Update the content for a specific URI and notify VS Code
   update(uri, content) {
     this.content.set(uri.toString(), content);
+    this._onDidChange.fire(uri);
   }
 }
 
@@ -1177,6 +1181,62 @@ async function activate(context) {
     context.subscriptions.push(changeWatcher);
   }
 
+  // Split view live sync: update the VCM split view when source file changes
+  // This is separate from liveSync setting and always enabled when split view is open
+  const splitViewSyncWatcher = vscode.workspace.onDidChangeTextDocument(async (e) => {
+    // Only sync if split view is open
+    if (!vcmEditor || !tempUri || !sourceDocUri) return;
+
+    // Only sync changes to the source document (not the vcm-view: document)
+    if (e.document.uri.scheme === "vcm-view") return;
+
+    // Only sync if this is the document that has the split view open
+    if (e.document.uri.toString() !== sourceDocUri.toString()) return;
+
+    const doc = e.document;
+    const relativePath = vscode.workspace.asRelativePath(doc.uri);
+
+    try {
+      // Load comments from VCM
+      const { allComments: comments } = await loadAllComments(relativePath);
+
+      // Get updated text from the document
+      const text = doc.getText();
+
+      // Determine which version to show based on current mode
+      const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
+
+      let showVersion;
+      if (isInCommentedMode) {
+        // Source is in commented mode, show clean in split view
+        showVersion = stripComments(text, doc.uri.path, comments);
+      } else {
+        // Source is in clean mode, show commented in split view
+        showVersion = injectComments(text, comments);
+      }
+
+      // Update the split view content
+      provider.update(tempUri, showVersion);
+    } catch (err) {
+      // Ignore errors - VCM might not exist yet
+    }
+  });
+  context.subscriptions.push(splitViewSyncWatcher);
+
+  // Clean up when split view is closed (always, not just when liveSync is enabled)
+  const closeWatcher = vscode.workspace.onDidCloseTextDocument((doc) => {
+    if (tempUri && doc.uri.toString() === tempUri.toString()) {
+      vcmEditor = null;
+      tempUri = null;
+      sourceDocUri = null;
+      if (scrollListener) {
+        scrollListener.dispose();
+        scrollListener = null;
+      }
+    }
+  });
+  context.subscriptions.push(closeWatcher);
+
   // ---------------------------------------------------------------------------
   // COMMAND: Toggle same file (hide/show comments)
   // ---------------------------------------------------------------------------
@@ -1920,6 +1980,9 @@ async function activate(context) {
       preview: true,  // Use preview tab (can be replaced)
     });
 
+    // Track which source document has the split view open for live sync
+    sourceDocUri = doc.uri;
+
     // Setup bidirectional click-to-jump (source → split view)
     const sourceEditor = editor;
     
@@ -1928,6 +1991,10 @@ async function activate(context) {
     scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
       if (!vcmEditor) return;
       if (e.textEditor !== sourceEditor) return;
+
+      // Only jump on mouse clicks, not keyboard navigation or typing
+      // e.kind will be undefined for typing, 1 for keyboard, 2 for mouse
+      if (e.kind !== vscode.TextEditorSelectionChangeKind.Mouse) return;
 
       const cursorPos = e.selections[0].active;
       const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
