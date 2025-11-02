@@ -752,6 +752,97 @@ async function activate(context) {
     vscode.workspace.registerTextDocumentContentProvider("vcm-view", provider)
   );
 
+  // ---------------------------------------------------------------------------
+  // Update context for menu items based on cursor position
+  // ---------------------------------------------------------------------------
+  async function updateAlwaysShowContext() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      await vscode.commands.executeCommand('setContext', 'vcm.commentIsAlwaysShow', false);
+      await vscode.commands.executeCommand('setContext', 'vcm.cursorOnComment', false);
+      return;
+    }
+
+    const doc = editor.document;
+    const selectedLine = editor.selection.active.line;
+    const line = doc.lineAt(selectedLine);
+    const text = line.text.trim();
+
+    // Check if cursor is on a comment line
+    const isOnComment = text.match(/^(\s*)(#|\/\/|--|%|;)/);
+    await vscode.commands.executeCommand('setContext', 'vcm.cursorOnComment', !!isOnComment);
+
+    if (!isOnComment) {
+      await vscode.commands.executeCommand('setContext', 'vcm.commentIsAlwaysShow', false);
+      return;
+    }
+
+    // Check if this comment is marked as alwaysShow
+    const relativePath = vscode.workspace.asRelativePath(doc.uri);
+    const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+    try {
+      const raw = (await vscode.workspace.fs.readFile(vcmFileUri)).toString();
+      const vcmData = JSON.parse(raw);
+      const comments = vcmData.comments || [];
+
+      // Find the anchor line for this comment
+      const lines = doc.getText().split("\n");
+      let anchorLineIndex = -1;
+      for (let i = selectedLine + 1; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+          anchorLineIndex = i;
+          break;
+        }
+      }
+
+      // If no code line below, fallback to the previous code line
+      if (anchorLineIndex === -1) {
+        for (let i = selectedLine - 1; i >= 0; i--) {
+          const trimmed = lines[i].trim();
+          if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+            anchorLineIndex = i;
+            break;
+          }
+        }
+      }
+
+      if (anchorLineIndex === -1) {
+        await vscode.commands.executeCommand('setContext', 'vcm.commentIsAlwaysShow', false);
+        return;
+      }
+
+      const anchorHash = hashLine(lines[anchorLineIndex], 0);
+
+      // Check if any comment with this anchor has alwaysShow
+      let isAlwaysShow = false;
+      for (const c of comments) {
+        if (c.anchor === anchorHash && c.alwaysShow) {
+          isAlwaysShow = true;
+          break;
+        }
+      }
+
+      await vscode.commands.executeCommand('setContext', 'vcm.commentIsAlwaysShow', isAlwaysShow);
+    } catch {
+      await vscode.commands.executeCommand('setContext', 'vcm.commentIsAlwaysShow', false);
+    }
+  }
+
+  // Update context when selection changes
+  context.subscriptions.push(
+    vscode.window.onDidChangeTextEditorSelection(() => updateAlwaysShowContext())
+  );
+
+  // Update context when active editor changes
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => updateAlwaysShowContext())
+  );
+
+  // Initial update
+  updateAlwaysShowContext();
+
   // ============================================================================
   // saveVCM()
   // ============================================================================
@@ -1221,6 +1312,8 @@ async function activate(context) {
         );
 
         vscode.window.showInformationMessage("VCM: Marked as Always Show ✅");
+        // Update context to refresh menu items
+        await updateAlwaysShowContext();
       } catch (err) {
         vscode.window.showErrorMessage("VCM: No .vcm file found. Try saving first.");
       }
@@ -1303,14 +1396,63 @@ async function activate(context) {
           return;
         }
 
-        // Save updated file
+        // Save updated VCM file
         vcmData.lastModified = new Date().toISOString();
         await vscode.workspace.fs.writeFile(
           vcmFileUri,
           Buffer.from(JSON.stringify(vcmData, null, 2), "utf8")
         );
 
+        // Check if we're in clean mode - if so, remove the comment from the document
+        const isInCleanMode = isCommentedMap.get(doc.uri.fsPath) === false;
+
+        if (isInCleanMode) {
+          // Remove the comment line(s) from the document
+          const edit = new vscode.WorkspaceEdit();
+
+          // For block comments, we need to find all lines in the block
+          const currentComments = extractComments(doc.getText(), doc.uri.path);
+          const matchingComment = currentComments.find(c => c.anchor === anchorHash);
+
+          if (matchingComment) {
+            if (matchingComment.type === "block" && matchingComment.block) {
+              // Remove all lines in the block (from first to last)
+              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLine));
+              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLine));
+              const range = new vscode.Range(firstLine, 0, lastLine + 1, 0);
+              edit.delete(doc.uri, range);
+            } else if (matchingComment.type === "inline") {
+              // Remove just the inline comment part (keep the code)
+              const lineText = lines[matchingComment.originalLine];
+              const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+
+              // Find where the comment starts
+              let commentStartIdx = -1;
+              for (const marker of commentMarkers) {
+                const idx = lineText.indexOf(marker);
+                if (idx > 0 && lineText[idx - 1].match(/\s/)) {
+                  commentStartIdx = idx - 1; // Include the whitespace before marker
+                  break;
+                }
+              }
+
+              if (commentStartIdx >= 0) {
+                const range = new vscode.Range(
+                  matchingComment.originalLine, commentStartIdx,
+                  matchingComment.originalLine, lineText.length
+                );
+                edit.delete(doc.uri, range);
+              }
+            }
+
+            await vscode.workspace.applyEdit(edit);
+            await doc.save();
+          }
+        }
+
         vscode.window.showInformationMessage("VCM: Unmarked Always Show ✅");
+        // Update context to refresh menu items
+        await updateAlwaysShowContext();
       } catch (err) {
         vscode.window.showErrorMessage("VCM: No .vcm file found. Try saving first.");
       }
