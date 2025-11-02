@@ -2140,6 +2140,55 @@ async function activate(context) {
         // Save updated comments (will split into shared/private automatically)
         await saveCommentsToVCM(relativePath, comments);
 
+        // Check if private comments are currently visible - if so, remove this comment
+        const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) !== false;
+
+        if (privateVisible) {
+          // Remove the comment from the document
+          const edit = new vscode.WorkspaceEdit();
+
+          // For block comments, we need to find all lines in the block
+          const currentComments = extractComments(doc.getText(), doc.uri.path);
+          const matchingComment = currentComments.find(c => c.anchor === anchorHash);
+
+          if (matchingComment) {
+            if (matchingComment.type === "block" && matchingComment.block) {
+              // Remove all lines in the block (from first to last)
+              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLine));
+              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLine));
+              const range = new vscode.Range(firstLine, 0, lastLine + 1, 0);
+              edit.delete(doc.uri, range);
+            } else if (matchingComment.type === "inline") {
+              // Remove just the inline comment part (keep the code)
+              const lineText = lines[matchingComment.originalLine];
+
+              // Find where the comment starts
+              let commentStartIndex = -1;
+              for (const marker of commentMarkers) {
+                const markerRegex = new RegExp(`(\\s+)(${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`);
+                const match = lineText.match(markerRegex);
+                if (match) {
+                  commentStartIndex = match.index;
+                  break;
+                }
+              }
+
+              if (commentStartIndex > 0) {
+                const range = new vscode.Range(
+                  matchingComment.originalLine,
+                  commentStartIndex,
+                  matchingComment.originalLine,
+                  lineText.length
+                );
+                edit.delete(doc.uri, range);
+              }
+            }
+
+            await vscode.workspace.applyEdit(edit);
+            await doc.save();
+          }
+        }
+
         vscode.window.showInformationMessage("VCM: Unmarked Private ✅");
         // Update context to refresh menu items
         await updateAlwaysShowContext();
