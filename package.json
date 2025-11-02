@@ -16,13 +16,23 @@
       "editor/context": [
         {
           "command": "vcm-view-comments-mirror.markAlwaysShow",
-          "when": "vcm.cursorOnComment && !vcm.commentIsAlwaysShow",
+          "when": "vcm.cursorOnComment && !vcm.commentIsAlwaysShow && !vcm.commentIsPrivate",
           "group": "navigation@2"
         },
         {
           "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
           "when": "vcm.cursorOnComment && vcm.commentIsAlwaysShow",
           "group": "navigation@2"
+        },
+        {
+          "command": "vcm-view-comments-mirror.markPrivate",
+          "when": "vcm.cursorOnComment && !vcm.commentIsPrivate && !vcm.commentIsAlwaysShow",
+          "group": "navigation@3"
+        },
+        {
+          "command": "vcm-view-comments-mirror.unmarkPrivate",
+          "when": "vcm.cursorOnComment && vcm.commentIsPrivate",
+          "group": "navigation@3"
         }
       ]
     },
@@ -62,6 +72,18 @@
       {
         "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
         "title": "VCM: Remove 'Always Show' This Comment"
+      },
+      {
+        "command": "vcm-view-comments-mirror.markPrivate",
+        "title": "VCM: Mark as Private"
+      },
+      {
+        "command": "vcm-view-comments-mirror.unmarkPrivate",
+        "title": "VCM: Unmark Private"
+      },
+      {
+        "command": "vcm-view-comments-mirror.togglePrivateComments",
+        "title": "VCM: Toggle Private Comments"
       }
     ],
     "keybindings": [
