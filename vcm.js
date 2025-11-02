@@ -178,20 +178,39 @@ async function detectInitialMode(doc, vcmFileUri, vcmDir) {
   const vcmPath = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
   try {
-    // VCM exists - check if first 5-10 comments from VCM match the file
+    // VCM exists - check if first 5-10 NON-alwaysShow comments from VCM match the file
     const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmPath)).toString());
     const comments = vcmData.comments || [];
 
-    if (comments.length === 0) {
-      return true; // No comments in VCM, assume commented mode
+    // Filter out alwaysShow comments for detection (they're always visible)
+    const nonAlwaysShowComments = comments.filter(c => !c.alwaysShow);
+
+    if (nonAlwaysShowComments.length === 0) {
+      // Only alwaysShow comments exist - need to check if there are other comments in file
+      // If the file has MORE comments than just alwaysShow, we're in commented mode
+      const lines = doc.getText().split('\n');
+      const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+      let commentCount = 0;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        for (const marker of commentMarkers) {
+          if (trimmed.startsWith(marker)) {
+            commentCount++;
+            break;
+          }
+        }
+      }
+      // If we have more comments in file than alwaysShow comments in VCM, we're in commented mode
+      return commentCount > comments.length;
     }
 
     const lines = doc.getText().split('\n');
-    const checkCount = Math.min(10, comments.length);
+    const checkCount = Math.min(10, nonAlwaysShowComments.length);
 
-    // Check if first N comments exist in the file
+    // Check if first N NON-alwaysShow comments exist in the file
     for (let i = 0; i < checkCount; i++) {
-      const comment = comments[i];
+      const comment = nonAlwaysShowComments[i];
       const lineIndex = comment.originalLine;
 
       if (lineIndex >= lines.length) continue;
@@ -374,12 +393,15 @@ function extractComments(text, filePath) {
 
 // Reconstruct source code by injecting comments back into clean code
 // Takes:
-//   cleanText - Code with all comments removed
+//   cleanText - Code with alwaysShow comments already present, other comments removed
 //   comments - Array of comment objects from extractComments()
 // Returns: Full source code with comments restored
 function injectComments(cleanText, comments) {
   const lines = cleanText.split("\n");
   const result = [];  // Will contain the final reconstructed code
+
+  // Filter out alwaysShow comments - they're already in cleanText
+  const commentsToInject = comments.filter(c => !c.alwaysShow);
 
   // Build a map of line content hash -> array of line indices (handles duplicates)
   const lineHashToIndices = new Map();
@@ -455,12 +477,12 @@ function injectComments(cleanText, comments) {
   };
 
   // Separate comments by type and sort by originalLine
-  const blockComments = comments.filter(c => c.type === "block").sort((a, b) => {
+  const blockComments = commentsToInject.filter(c => c.type === "block").sort((a, b) => {
     const aLine = a.block[0]?.originalLine || 0;
     const bLine = b.block[0]?.originalLine || 0;
     return aLine - bLine;
   });
-  const inlineComments = comments.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
+  const inlineComments = commentsToInject.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
 
   // Track which indices we've already used
   const usedIndices = new Set();
@@ -559,7 +581,8 @@ function injectComments(cleanText, comments) {
 // 3. Preserve blank lines to maintain code structure
 // 4. Handle strings properly - don't remove comment markers inside strings
 // 5. Language-aware: only remove markers appropriate for the file type
-function stripComments(text, filePath) {
+// 6. Skip comments marked with alwaysShow flag (they appear in all modes)
+function stripComments(text, filePath, vcmComments = []) {
   // Get comment markers for this file type from our centralized config
   const commentMarkers = getCommentMarkersForFile(filePath);
 
@@ -627,14 +650,73 @@ function stripComments(text, filePath) {
     return -1; // No comment found
   };
 
+  // Build a set of comment anchor hashes that should always be shown
+  const alwaysShowAnchors = new Set();
+  for (const comment of vcmComments) {
+    if (comment.alwaysShow) {
+      alwaysShowAnchors.add(comment.anchor);
+    }
+  }
+
+  // If there are no alwaysShow comments, use the simple stripping logic
+  if (alwaysShowAnchors.size === 0) {
+    return text
+      .split("\n")
+      .filter(line => {
+        const trimmed = line.trim();
+        return !trimmed || !lineStartPattern.test(trimmed);
+      })
+      .map(line => {
+        const commentPos = findCommentStart(line);
+        if (commentPos >= 0) {
+          return line.substring(0, commentPos).trimEnd();
+        }
+        return line;
+      })
+      .join("\n");
+  }
+
+  // Extract current comments to identify which ones are alwaysShow by matching anchors
+  const currentComments = extractComments(text, filePath);
+
+  // Build a set of line indices that contain alwaysShow comments
+  const alwaysShowLines = new Set();
+  const alwaysShowInlineComments = new Map();
+
+  for (const current of currentComments) {
+    if (alwaysShowAnchors.has(current.anchor)) {
+      if (current.type === "block" && current.block) {
+        // For block comments, add all line indices in the block
+        for (const blockLine of current.block) {
+          alwaysShowLines.add(blockLine.originalLine);
+        }
+      } else if (current.type === "inline") {
+        // For inline comments, store the line index and text
+        alwaysShowLines.add(current.originalLine);
+        alwaysShowInlineComments.set(current.originalLine, current.text || "");
+      }
+    }
+  }
+
   return text
     .split("\n")
-    .filter(line => {
+    .filter((line, lineIndex) => {
       const trimmed = line.trim();
-      // Keep blank lines OR lines that aren't pure comments
-      return !trimmed || !lineStartPattern.test(trimmed);
+      // Keep blank lines
+      if (!trimmed) return true;
+
+      // Keep lines that are marked as alwaysShow
+      if (alwaysShowLines.has(lineIndex)) return true;
+
+      // Otherwise, filter out pure comment lines
+      return !lineStartPattern.test(trimmed);
     })
-    .map(line => {
+    .map((line, lineIndex) => {
+      // If this line has an alwaysShow inline comment, preserve it
+      if (alwaysShowInlineComments.has(lineIndex)) {
+        return line; // Keep the entire line including the comment
+      }
+
       // Remove inline comments: everything after comment marker (if not in string)
       const commentPos = findCommentStart(line);
       if (commentPos >= 0) {
@@ -734,8 +816,60 @@ async function activate(context) {
       //   → The user is editing the commented version.
       //   → Replace entire VCM with what's currently visible.
       //   → Always extract current state to detect deletions immediately.
+      //   → PRESERVE metadata like alwaysShow from existing comments.
 
-      finalComments = currentComments;
+      // Build a map of existing comments with their metadata
+      const existingByKey = new Map();
+      for (const existing of existingComments) {
+        const key = `${existing.type}:${existing.anchor}`;
+        if (!existingByKey.has(key)) {
+          existingByKey.set(key, []);
+        }
+        existingByKey.get(key).push(existing);
+      }
+
+      // Build a map of current comments for checking what exists
+      const currentByKey = new Map();
+      for (const current of currentComments) {
+        const key = `${current.type}:${current.anchor}`;
+        if (!currentByKey.has(key)) {
+          currentByKey.set(key, []);
+        }
+        currentByKey.get(key).push(current);
+      }
+
+      // Start with updated current comments (preserving metadata)
+      finalComments = currentComments.map(current => {
+        const key = `${current.type}:${current.anchor}`;
+        const candidates = existingByKey.get(key) || [];
+
+        if (candidates.length > 0) {
+          // Found a match - preserve alwaysShow and other metadata
+          const existing = candidates[0];
+          // Remove this existing comment from the map so we don't add it again
+          candidates.shift();
+          if (candidates.length === 0) {
+            existingByKey.delete(key);
+          }
+          return {
+            ...current,
+            alwaysShow: existing.alwaysShow || undefined, // Preserve alwaysShow
+            // Add any other metadata fields here if needed in the future
+          };
+        }
+
+        // No match found - return as-is
+        return current;
+      });
+
+      // Add any existing comments that weren't in currentComments
+      // (these are comments that were hidden/not extracted, like non-alwaysShow in clean mode)
+      for (const [key, candidates] of existingByKey) {
+        if (!currentByKey.has(key)) {
+          // This existing comment wasn't found in current - keep it
+          finalComments.push(...candidates);
+        }
+      }
 
     } else {
       // Clean mode:
@@ -894,18 +1028,29 @@ async function activate(context) {
         await vscode.workspace.fs.stat(vcmFileUri);
       } catch {
         // No .vcm yet — extract and save before removing comments
+        // We're still in commented mode here, so this will extract all comments
         await saveVCM(doc);
       }
 
       // If liveSync is disabled, always update manually
+      // We're still in commented mode here, so this will extract all comments
       const config = vscode.workspace.getConfiguration("vcm");
       const liveSync = config.get("liveSync", false);
       if (!liveSync) {
         await saveVCM(doc);
       }
 
-      // Strip comments to show clean version
-      newText = stripComments(text, doc.uri.path);
+      // Load VCM comments to check for alwaysShow
+      let vcmComments = [];
+      try {
+        const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
+        vcmComments = vcmData.comments || [];
+      } catch {
+        // No VCM data available
+      }
+
+      // Strip comments to show clean version (but keep alwaysShow comments)
+      newText = stripComments(text, doc.uri.path, vcmComments);
       // Mark this file as now in clean mode
       isCommentedMap.set(doc.uri.fsPath, false);
       vscode.window.showInformationMessage("VCM: Switched to clean mode (comments hidden)");
@@ -934,8 +1079,8 @@ async function activate(context) {
           return merged;
         });
 
-        // Get clean code (strip all comments)
-        const cleanText = stripComments(text, doc.uri.path);
+        // Get clean code (strip all comments except alwaysShow)
+        const cleanText = stripComments(text, doc.uri.path, mergedComments);
 
         // Inject merged comments into clean code
         newText = injectComments(cleanText, mergedComments);
@@ -964,8 +1109,8 @@ async function activate(context) {
         await saveVCM(doc);
         try {
           const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
-          // Strip comments before injecting
-          const cleanText = stripComments(text, doc.uri.path);
+          // Strip comments before injecting (except alwaysShow)
+          const cleanText = stripComments(text, doc.uri.path, vcmData.comments || []);
           newText = injectComments(cleanText, vcmData.comments || []);
 
           // Mark that we just injected from VCM - don't re-extract on next save
@@ -990,6 +1135,188 @@ async function activate(context) {
     setTimeout(() => (vcmSyncEnabled = true), 800);
   });
   context.subscriptions.push(toggleCurrentFileComments);
+
+  // ---------------------------------------------------------------------------
+  // COMMAND: Right-click -> "Always Show This Comment"
+  // ---------------------------------------------------------------------------
+  const markAlwaysShow = vscode.commands.registerCommand(
+    "vcm-view-comments-mirror.markAlwaysShow",
+    async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const doc = editor.document;
+      const selectedLine = editor.selection.active.line;
+      const line = doc.lineAt(selectedLine);
+      const text = line.text.trim();
+
+      // Only allow actual comment lines
+      if (!text.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+        vscode.window.showWarningMessage("VCM: You can only mark comment lines as 'Always Show'.");
+        return;
+      }
+
+      const relativePath = vscode.workspace.asRelativePath(doc.uri);
+      const vcmDir = vscode.Uri.joinPath(
+        vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(process.cwd()),
+        ".vcm"
+      );
+      const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+      try {
+        const raw = (await vscode.workspace.fs.readFile(vcmFileUri)).toString();
+        const vcmData = JSON.parse(raw);
+        const comments = vcmData.comments || [];
+
+        // --- NEW LOGIC ---
+        // Compute hashes for the *code anchor* this comment belongs to.
+        // 1. Find the next non-blank, non-comment line (the anchor line).
+        const lines = doc.getText().split("\n");
+        let anchorLineIndex = -1;
+        for (let i = selectedLine + 1; i < lines.length; i++) {
+          const trimmed = lines[i].trim();
+          if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+            anchorLineIndex = i;
+            break;
+          }
+        }
+
+        // If no code line below, fallback to the previous code line.
+        if (anchorLineIndex === -1) {
+          for (let i = selectedLine - 1; i >= 0; i--) {
+            const trimmed = lines[i].trim();
+            if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+              anchorLineIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (anchorLineIndex === -1) {
+          vscode.window.showErrorMessage("VCM: Could not determine anchor line for this comment.");
+          return;
+        }
+
+        const anchorHash = hashLine(lines[anchorLineIndex], 0);
+
+        // --- SEARCH FOR COMMENT WITH THIS ANCHOR ---
+        let found = false;
+        for (const c of comments) {
+          if (c.anchor === anchorHash) {
+            c.alwaysShow = true;
+            found = true;
+          }
+        }
+
+        if (!found) {
+          vscode.window.showWarningMessage("VCM: Could not find a matching comment entry in .vcm.");
+          return;
+        }
+
+        // Save updated file
+        vcmData.lastModified = new Date().toISOString();
+        await vscode.workspace.fs.writeFile(
+          vcmFileUri,
+          Buffer.from(JSON.stringify(vcmData, null, 2), "utf8")
+        );
+
+        vscode.window.showInformationMessage("VCM: Marked as Always Show ✅");
+      } catch (err) {
+        vscode.window.showErrorMessage("VCM: No .vcm file found. Try saving first.");
+      }
+    }
+  );
+  context.subscriptions.push(markAlwaysShow);
+
+  // ---------------------------------------------------------------------------
+  // COMMAND: Right-click -> "Unmark Always Show"
+  // ---------------------------------------------------------------------------
+  const unmarkAlwaysShow = vscode.commands.registerCommand(
+    "vcm-view-comments-mirror.unmarkAlwaysShow",
+    async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+
+      const doc = editor.document;
+      const selectedLine = editor.selection.active.line;
+      const line = doc.lineAt(selectedLine);
+      const text = line.text.trim();
+
+      // Only allow actual comment lines
+      if (!text.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+        vscode.window.showWarningMessage("VCM: You can only unmark comment lines.");
+        return;
+      }
+
+      const relativePath = vscode.workspace.asRelativePath(doc.uri);
+      const vcmDir = vscode.Uri.joinPath(
+        vscode.workspace.workspaceFolders?.[0]?.uri || vscode.Uri.file(process.cwd()),
+        ".vcm"
+      );
+      const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+      try {
+        const raw = (await vscode.workspace.fs.readFile(vcmFileUri)).toString();
+        const vcmData = JSON.parse(raw);
+        const comments = vcmData.comments || [];
+
+        // Find the anchor line (same logic as markAlwaysShow)
+        const lines = doc.getText().split("\n");
+        let anchorLineIndex = -1;
+        for (let i = selectedLine + 1; i < lines.length; i++) {
+          const trimmed = lines[i].trim();
+          if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+            anchorLineIndex = i;
+            break;
+          }
+        }
+
+        // If no code line below, fallback to the previous code line
+        if (anchorLineIndex === -1) {
+          for (let i = selectedLine - 1; i >= 0; i--) {
+            const trimmed = lines[i].trim();
+            if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
+              anchorLineIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (anchorLineIndex === -1) {
+          vscode.window.showErrorMessage("VCM: Could not determine anchor line for this comment.");
+          return;
+        }
+
+        const anchorHash = hashLine(lines[anchorLineIndex], 0);
+
+        // Search for comment with this anchor and remove alwaysShow
+        let found = false;
+        for (const c of comments) {
+          if (c.anchor === anchorHash && c.alwaysShow) {
+            delete c.alwaysShow;
+            found = true;
+          }
+        }
+
+        if (!found) {
+          vscode.window.showWarningMessage("VCM: This comment is not marked as Always Show.");
+          return;
+        }
+
+        // Save updated file
+        vcmData.lastModified = new Date().toISOString();
+        await vscode.workspace.fs.writeFile(
+          vcmFileUri,
+          Buffer.from(JSON.stringify(vcmData, null, 2), "utf8")
+        );
+
+        vscode.window.showInformationMessage("VCM: Unmarked Always Show ✅");
+      } catch (err) {
+        vscode.window.showErrorMessage("VCM: No .vcm file found. Try saving first.");
+      }
+    }
+  );
+  context.subscriptions.push(unmarkAlwaysShow);
 
   // ---------------------------------------------------------------------------
   // COMMAND: Split view with/without comments
@@ -1021,15 +1348,21 @@ async function activate(context) {
 
     // Create clean version and version with comments
     const text = doc.getText();
-    const clean = stripComments(text, doc.uri.path);
+    const clean = stripComments(text, doc.uri.path, comments);
     const withComments = injectComments(clean, comments);
 
-    // Determine if source already has comments
-    const hasComments = text.trim() !== clean.trim();
+    // Detect initial state if not already set
+    if (!isCommentedMap.has(doc.uri.fsPath)) {
+      const initialState = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      isCommentedMap.set(doc.uri.fsPath, initialState);
+    }
 
-    // If source has comments, show clean; otherwise, show commented
-    const showVersion = hasComments ? clean : withComments;
-    const labelType = hasComments ? "clean" : "with comments";
+    // Check the current mode from our state map
+    const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
+
+    // If source is in commented mode, show clean; otherwise, show commented
+    const showVersion = isInCommentedMode ? clean : withComments;
+    const labelType = isInCommentedMode ? "clean" : "with comments";
 
     // Insert timestamp before file extension to preserve language detection
     const uniqueLabel = vcmLabel.replace(/(\.[^/.]+)$/, `_${Date.now()}$1`);

@@ -8,26 +8,37 @@
     "onStartupFinished"
   ],
   "main": "./vcm.js",
-  "engines": { "vscode": "^1.90.0" },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
   "contributes": {
+    "menus": {
+      "editor/context": [
+        {
+          "command": "vcm-view-comments-mirror.markAlwaysShow",
+          "when": "editorHasSelection || editorTextFocus",
+          "group": "navigation@2"
+        },
+        {
+          "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
+          "when": "editorHasSelection || editorTextFocus",
+          "group": "navigation@2"
+        }
+      ]
+    },
     "configuration": {
       "type": "object",
       "title": "VCM Settings",
       "properties": {
-        "vcm-view-comments-mirror.autoSplitView": {
+        "vcm-view-comments-mirror.preserveBlockSpacing": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically open the comments view in a split editor on the right when toggled."
+          "description": "Preserve visible blank lines after block comments in clean mode."
         },
-        "vcm-view-comments-mirror.liveSync": {
+        "vcm-view-comments-mirror.moveCommentWithAnchor": {
           "type": "boolean",
           "default": false,
-          "description": "Auto-save .vcm files while typing (2-second debounce)."
-        },
-        "vcm-view-comments-mirror.storageMode": {
-          "enum": ["clean-repo", "documented-repo"],
-          "default": "documented-repo",
-          "description": "clean-repo: files are saved without comments, toggle shows comments.\ndocumented-repo: files are saved with comments, toggle shows clean version."
+          "description": "Preserve visible blank lines after block comments in clean mode."
         }
       }
     },
@@ -43,6 +54,14 @@
       {
         "command": "vcm-view-comments-mirror.toggleLocalComments",
         "title": "VCM: Hide/Show Local Comments (Repo-Wide)"
+      },
+      {
+        "command": "vcm-view-comments-mirror.markAlwaysShow",
+        "title": "VCM: Always Show This Line"
+      },
+      {
+        "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
+        "title": "VCM: Unmark Always Show"
       }
     ],
     "keybindings": [
@@ -60,8 +79,15 @@
       }
     ]
   },
-  "categories": ["Other"],
-  "keywords": ["comments", "documentation", "code-review", "clean-code"],
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "comments",
+    "documentation",
+    "code-review",
+    "clean-code"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/Serendipbrity/vcm-view-comments-mirror"
