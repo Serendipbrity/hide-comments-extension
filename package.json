@@ -16,12 +16,12 @@
       "editor/context": [
         {
           "command": "vcm-view-comments-mirror.markAlwaysShow",
-          "when": "editorHasSelection || editorTextFocus",
+          "when": "vcm.cursorOnComment && !vcm.commentIsAlwaysShow",
           "group": "navigation@2"
         },
         {
           "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
-          "when": "editorHasSelection || editorTextFocus",
+          "when": "vcm.cursorOnComment && vcm.commentIsAlwaysShow",
           "group": "navigation@2"
         }
       ]
@@ -57,11 +57,11 @@
       },
       {
         "command": "vcm-view-comments-mirror.markAlwaysShow",
-        "title": "VCM: Always Show This Line"
+        "title": "VCM: Always Show This Comment"
       },
       {
         "command": "vcm-view-comments-mirror.unmarkAlwaysShow",
-        "title": "VCM: Unmark Always Show"
+        "title": "VCM: Remove 'Always Show' This Comment"
       }
     ],
     "keybindings": [
