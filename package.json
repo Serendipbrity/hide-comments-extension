@@ -1,8 +1,8 @@
 {
   "name": "vcm-view-comments-mirror",
   "displayName": "VCM - View Comments Mirror",
-  "version": "0.1.0",
-  "publisher": "brittanicourt",
+  "version": "0.1.1",
+  "publisher": "serendipbrity",
   "description": "Invisible documentation layer for code - keep repos clean, comments versioned",
   "activationEvents": [
     "onStartupFinished"
@@ -113,6 +113,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Serendipbrity/vcm-view-comments-mirror"
+  },
+  "scripts": {
+    "build:vsix": "vsce package && code --install-extension *.vsix --force"
   },
   "license": "MIT"
 }
