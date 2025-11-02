@@ -1027,12 +1027,19 @@ async function activate(context) {
 
       // Build a map of existing comments with their metadata
       const existingByKey = new Map();
+      const existingByText = new Map(); // Secondary index by text for anchor updates
       for (const existing of existingComments) {
         const key = `${existing.type}:${existing.anchor}`;
         if (!existingByKey.has(key)) {
           existingByKey.set(key, []);
         }
         existingByKey.get(key).push(existing);
+
+        // Also index by text to handle anchor changes
+        const textKey = existing.text || (existing.block ? existing.block.map(b => b.text).join('\n') : '');
+        if (textKey && !existingByText.has(textKey)) {
+          existingByText.set(textKey, existing);
+        }
       }
 
       // Build a map of current comments for checking what exists
@@ -1045,14 +1052,18 @@ async function activate(context) {
         currentByKey.get(key).push(current);
       }
 
+      // Track which existing comments we've matched to avoid duplicates
+      const matchedExisting = new Set();
+
       // Start with updated current comments (preserving metadata)
       finalComments = currentComments.map(current => {
         const key = `${current.type}:${current.anchor}`;
         const candidates = existingByKey.get(key) || [];
 
         if (candidates.length > 0) {
-          // Found a match - preserve alwaysShow and other metadata
+          // Found a match by anchor - preserve alwaysShow and other metadata
           const existing = candidates[0];
+          matchedExisting.add(existing);
           // Remove this existing comment from the map so we don't add it again
           candidates.shift();
           if (candidates.length === 0) {
@@ -1065,16 +1076,34 @@ async function activate(context) {
           };
         }
 
-        // No match found - return as-is
+        // No match by anchor - try matching by text (anchor might have changed)
+        const currentText = current.text || (current.block ? current.block.map(b => b.text).join('\n') : '');
+        if (currentText && existingByText.has(currentText)) {
+          const existing = existingByText.get(currentText);
+          if (!matchedExisting.has(existing)) {
+            // Found a match by text - this is the same comment with updated anchor
+            matchedExisting.add(existing);
+            return {
+              ...current,
+              alwaysShow: existing.alwaysShow || undefined,
+            };
+          }
+        }
+
+        // No match found - return as-is (new comment)
         return current;
       });
 
-      // Add any existing comments that weren't in currentComments
+      // Add any existing comments that weren't matched
       // (these are comments that were hidden/not extracted, like non-alwaysShow in clean mode)
       for (const [key, candidates] of existingByKey) {
         if (!currentByKey.has(key)) {
-          // This existing comment wasn't found in current - keep it
-          finalComments.push(...candidates);
+          // This existing comment wasn't found in current - keep it if not already matched
+          for (const candidate of candidates) {
+            if (!matchedExisting.has(candidate)) {
+              finalComments.push(candidate);
+            }
+          }
         }
       }
 
@@ -1197,9 +1226,6 @@ async function activate(context) {
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
 
     try {
-      // Load comments from VCM
-      const { allComments: comments } = await loadAllComments(relativePath);
-
       // Get updated text from the document
       const text = doc.getText();
 
@@ -1209,9 +1235,13 @@ async function activate(context) {
       let showVersion;
       if (isInCommentedMode) {
         // Source is in commented mode, show clean in split view
-        showVersion = stripComments(text, doc.uri.path, comments);
+        // Load VCM comments to preserve alwaysShow metadata
+        const { allComments: vcmComments } = await loadAllComments(relativePath);
+        showVersion = stripComments(text, doc.uri.path, vcmComments);
       } else {
         // Source is in clean mode, show commented in split view
+        // Load comments from VCM to inject
+        const { allComments: comments } = await loadAllComments(relativePath);
         showVersion = injectComments(text, comments);
       }
 
