@@ -1,12 +1,11 @@
 {
   "name": "vcm-view-comments-mirror",
   "displayName": "VCM - View Comments Mirror",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "publisher": "serendipbrity",
-  "description": "Invisible documentation layer for code - keep repos clean, comments versioned",
-  "activationEvents": [
-    "onStartupFinished"
-  ],
+  "description": "Invisible documentation layer for code — keep repos clean, comments versioned.",
+  "icon": "icon.png",
+  "activationEvents": ["onStartupFinished"],
   "main": "./vcm.js",
   "engines": {
     "vscode": "^1.90.0"

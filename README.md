@@ -21,7 +21,7 @@ If your team does not use VCM, simply add .vcm to your .gitignore and mark your 
 ## Features
 #### Comment Layer Control
 - Toggle clean / commented view per file (Ctrl+V+C).
-Split view mode — see clean code and commented code side-by-side.
+- Split view mode — see clean code and commented code side-by-side. Split view is a temporary view.
 - Comments marked private are stored separately in .vcm/private/ which can be added to your gitignore or pushed up to share with team members who also use the extension.
 - Comments automatically anchor to their code via stable content hashes.
 - When you move, copy, or paste code, your comments move with it.
