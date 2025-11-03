@@ -1474,7 +1474,7 @@ async function activate(context) {
     clearTimeout(splitViewUpdateTimeout);
     splitViewUpdateTimeout = setTimeout(async () => {
       try {
-        // Get updated text from the document
+        // Get updated text from the document (source of truth)
         const text = doc.getText();
 
         // Determine which version to show based on current mode
@@ -2247,6 +2247,9 @@ async function activate(context) {
             await vscode.commands.executeCommand("workbench.action.files.save");
           }
 
+          // Set the global state to false since we auto-hid the comment
+          privateCommentsVisible.set(doc.uri.fsPath, false);
+
           vscode.window.showInformationMessage("VCM: Private comment hidden 🔒 Toggle Private Comments to view.");
         } else {
           vscode.window.showInformationMessage("VCM: Marked as Private 🔒");
@@ -2508,65 +2511,77 @@ async function activate(context) {
         const privateAnchors = new Set(privateComments.map(c => c.anchor));
         const privateCommentsInDoc = currentComments.some(c => privateAnchors.has(c.anchor));
 
-        // Use document state as source of truth, fallback to stored state
-        const currentlyVisible = privateCommentsInDoc || (privateCommentsVisible.get(doc.uri.fsPath) === true);
+        // Determine current visibility state
+        // If we have an explicit stored state, use it
+        // Otherwise, use document state as source of truth
+        const storedState = privateCommentsVisible.get(doc.uri.fsPath);
+        const currentlyVisible = storedState !== undefined ? storedState : privateCommentsInDoc;
 
         let newText;
         if (currentlyVisible) {
-          // Hide private comments - use stripComments with private comments as the filter
-          // This works like stripComments but only removes private comments
+          // Hide private comments - remove ONLY private comments using anchor hashes
           const privateAnchors = new Set(privateComments.map(c => c.anchor));
 
-          // Extract current comments to find their current positions
+          // Extract current comments to identify which ones are private
           const currentComments = extractComments(text, doc.uri.path);
 
-          // Build set of line indices for private comments
-          const privateLines = new Set();
-          const privateInlineLines = new Map();
+          // Build a map of private comments by type and anchor for removal
+          const privateBlocksToRemove = [];
+          const privateInlinesToRemove = [];
 
           for (const current of currentComments) {
             if (privateAnchors.has(current.anchor)) {
-              if (current.type === "block" && current.block) {
-                for (const blockLine of current.block) {
-                  privateLines.add(blockLine.originalLine);
-                }
+              if (current.type === "block") {
+                privateBlocksToRemove.push(current);
               } else if (current.type === "inline") {
-                privateLines.add(current.originalLine);
-                privateInlineLines.set(current.originalLine, current.text || "");
+                privateInlinesToRemove.push(current);
               }
             }
           }
 
-          // Strip private comments from the document
-          newText = text
-            .split("\n")
-            .filter((line, lineIndex) => {
-              const trimmed = line.trim();
-              if (!trimmed) return true; // Keep blank lines
-              if (privateLines.has(lineIndex) && !privateInlineLines.has(lineIndex)) {
-                return false; // Remove block comment lines
-              }
-              return true;
-            })
-            .map((line, lineIndex) => {
-              // Remove inline private comments
-              if (privateInlineLines.has(lineIndex)) {
-                const commentMarkers = getCommentMarkersForFile(doc.uri.path);
-                let commentStartIdx = -1;
-                for (const marker of commentMarkers) {
-                  const idx = line.indexOf(marker);
-                  if (idx > 0 && line[idx - 1].match(/\s/)) {
-                    commentStartIdx = idx - 1;
-                    break;
-                  }
-                }
-                if (commentStartIdx >= 0) {
-                  return line.substring(0, commentStartIdx).trimEnd();
-                }
-              }
-              return line;
-            }).join("\n");
+          // Remove private comments from the text
+          const lines = text.split("\n");
+          const linesToRemove = new Set();
 
+          // Mark block comment lines for removal
+          for (const block of privateBlocksToRemove) {
+            if (block.block) {
+              for (const blockLine of block.block) {
+                linesToRemove.add(blockLine.originalLine);
+              }
+            }
+          }
+
+          // Process lines: filter out block comments and strip inline comments
+          const resultLines = [];
+          for (let i = 0; i < lines.length; i++) {
+            // Skip lines that are part of private block comments
+            if (linesToRemove.has(i)) continue;
+
+            let line = lines[i];
+
+            // Check if this line has a private inline comment to remove
+            const inlineToRemove = privateInlinesToRemove.find(c => c.originalLine === i);
+            if (inlineToRemove) {
+              // Remove the inline comment using the same logic as stripComments
+              const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+              let commentStartIdx = -1;
+              for (const marker of commentMarkers) {
+                const idx = line.indexOf(marker);
+                if (idx > 0 && line[idx - 1].match(/\s/)) {
+                  commentStartIdx = idx - 1;
+                  break;
+                }
+              }
+              if (commentStartIdx >= 0) {
+                line = line.substring(0, commentStartIdx).trimEnd();
+              }
+            }
+
+            resultLines.push(line);
+          }
+
+          newText = resultLines.join("\n");
           privateCommentsVisible.set(doc.uri.fsPath, false);
           vscode.window.showInformationMessage("VCM: Private comments hidden 🔒");
         } else {
