@@ -1456,6 +1456,7 @@ async function activate(context) {
 
   // Split view live sync: update the VCM split view when source file changes
   // This is separate from liveSync setting and always enabled when split view is open
+  let splitViewUpdateTimeout;
   const splitViewSyncWatcher = vscode.workspace.onDidChangeTextDocument(async (e) => {
     // Only sync if split view is open
     if (!vcmEditor || !tempUri || !sourceDocUri) return;
@@ -1469,33 +1470,37 @@ async function activate(context) {
     const doc = e.document;
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
 
-    try {
-      // Get updated text from the document
-      const text = doc.getText();
+    // Debounce updates to prevent multiple rapid injections
+    clearTimeout(splitViewUpdateTimeout);
+    splitViewUpdateTimeout = setTimeout(async () => {
+      try {
+        // Get updated text from the document
+        const text = doc.getText();
 
-      // Determine which version to show based on current mode
-      const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
+        // Determine which version to show based on current mode
+        const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
 
-      let showVersion;
-      if (isInCommentedMode) {
-        // Source is in commented mode, show clean in split view
-        // Load VCM comments to preserve alwaysShow metadata
-        const { allComments: vcmComments } = await loadAllComments(relativePath);
-        const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
-        showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
-      } else {
-        // Source is in clean mode, show commented in split view
-        // Load comments from VCM to inject
-        const { allComments: comments } = await loadAllComments(relativePath);
-        const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
-        showVersion = injectComments(text, comments, includePrivate);
+        let showVersion;
+        if (isInCommentedMode) {
+          // Source is in commented mode, show clean in split view
+          // Load VCM comments to preserve alwaysShow metadata
+          const { allComments: vcmComments } = await loadAllComments(relativePath);
+          const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+          showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
+        } else {
+          // Source is in clean mode, show commented in split view
+          // Load comments from VCM to inject
+          const { allComments: comments } = await loadAllComments(relativePath);
+          const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+          showVersion = injectComments(text, comments, includePrivate);
+        }
+
+        // Update the split view content
+        provider.update(tempUri, showVersion);
+      } catch (err) {
+        // Ignore errors - VCM might not exist yet
       }
-
-      // Update the split view content
-      provider.update(tempUri, showVersion);
-    } catch (err) {
-      // Ignore errors - VCM might not exist yet
-    }
+    }, 100); // Small debounce delay to prevent rapid duplicate updates
   });
   context.subscriptions.push(splitViewSyncWatcher);
 
