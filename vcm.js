@@ -379,6 +379,10 @@ function extractComments(text, filePath) {
     // CASE 3: We have buffered comment lines above this code line
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
+      // Count blank lines between the last comment and this code line
+      const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLine;
+      const blankLinesBetween = i - lastCommentLine - 1;
+
       // Store context: previous code line and next code line
       const prevIdx = findPrevCodeLine(i);
       const nextIdx = findNextCodeLine(i);
@@ -390,6 +394,7 @@ function extractComments(text, filePath) {
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         insertAbove: true,
         block: commentBuffer,
+        trailingBlankLines: blankLinesBetween > 0 ? blankLinesBetween : undefined,
       });
       commentBuffer = []; // Clear buffer for next block
     }
@@ -566,6 +571,13 @@ function injectComments(cleanText, comments) {
         for (const c of allBlockLines) {
           // Just push the full text as-is (includes indent, marker, spacing, text)
           result.push(c.text);
+        }
+
+        // Add trailing blank lines if they exist (blank lines between comment and code)
+        if (block.trailingBlankLines) {
+          for (let j = 0; j < block.trailingBlankLines; j++) {
+            result.push("");
+          }
         }
       }
     }
@@ -1477,11 +1489,8 @@ async function activate(context) {
           return merged;
         });
 
-        // Get clean code (strip all comments except alwaysShow)
-        const cleanText = stripComments(text, doc.uri.path, mergedComments);
-
-        // Inject merged comments into clean code
-        newText = injectComments(cleanText, mergedComments);
+        // Text is already in clean mode, so just inject comments directly
+        newText = injectComments(text, mergedComments);
 
         // Save the merged VCM before toggling
         const updatedVcmData = {
