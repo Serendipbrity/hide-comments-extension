@@ -1371,19 +1371,10 @@ async function activate(context) {
             const existing = candidates[0]; // Use first match (could improve with context matching)
 
             if (current.type === "inline") {
-              // For inline comments, accumulate in text_cleanMode
-              // Each new comment typed in clean mode gets appended
-              const currentText = current.text || "";
-              const previousCleanModeText = existing.text_cleanMode || "";
-
-              // Check if this exact text is already in text_cleanMode
-              if (!previousCleanModeText.includes(currentText.trim())) {
-                // Prepend new comment to existing clean mode text
-                existing.text_cleanMode = currentText + previousCleanModeText;
-              } else {
-                // Already have this comment, keep as is
-                existing.text_cleanMode = previousCleanModeText;
-              }
+              // For inline comments, just store the current text in text_cleanMode
+              // Since extractComments already combines all inline comments on the line,
+              // current.text contains the full accumulated text from the document
+              existing.text_cleanMode = current.text;
             } else if (current.type === "block") {
               // For block comments, store the block array in text_cleanMode
               existing.text_cleanMode = current.block;
