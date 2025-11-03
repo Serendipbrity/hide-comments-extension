@@ -440,13 +440,19 @@ function extractComments(text, filePath) {
 // Takes:
 //   cleanText - Code with alwaysShow comments already present, other comments removed
 //   comments - Array of comment objects from extractComments()
+//   includePrivate - Whether to include private comments (default: false)
 // Returns: Full source code with comments restored
-function injectComments(cleanText, comments) {
+function injectComments(cleanText, comments, includePrivate = false) {
   const lines = cleanText.split("\n");
   const result = [];  // Will contain the final reconstructed code
 
-  // Filter out alwaysShow and private comments - they're managed separately
-  const commentsToInject = comments.filter(c => !c.alwaysShow && !c.isPrivate);
+  // Filter out alwaysShow comments (managed separately)
+  // Include/exclude private comments based on includePrivate parameter
+  const commentsToInject = comments.filter(c => {
+    if (c.alwaysShow) return false; // Always exclude alwaysShow
+    if (c.isPrivate && !includePrivate) return false; // Exclude private if not included
+    return true;
+  });
 
   // Build a map of line content hash -> array of line indices (handles duplicates)
   const lineHashToIndices = new Map();
@@ -689,7 +695,7 @@ function injectComments(cleanText, comments) {
 // 4. Handle strings properly - don't remove comment markers inside strings
 // 5. Language-aware: only remove markers appropriate for the file type
 // 6. Skip comments marked with alwaysShow flag (they appear in all modes)
-function stripComments(text, filePath, vcmComments = []) {
+function stripComments(text, filePath, vcmComments = [], keepPrivate = false) {
   // Get comment markers for this file type from our centralized config
   const commentMarkers = getCommentMarkersForFile(filePath);
 
@@ -757,11 +763,15 @@ function stripComments(text, filePath, vcmComments = []) {
     return -1; // No comment found
   };
 
-  // Build a set of comment anchor hashes that should always be shown
+  // Build sets of comment anchor hashes that should be kept
   const alwaysShowAnchors = new Set();
+  const privateAnchors = new Set();
   for (const comment of vcmComments) {
     if (comment.alwaysShow) {
       alwaysShowAnchors.add(comment.anchor);
+    }
+    if (comment.isPrivate && keepPrivate) {
+      privateAnchors.add(comment.anchor);
     }
   }
 
@@ -772,6 +782,8 @@ function stripComments(text, filePath, vcmComments = []) {
   const allCommentBlockLines = new Set();
   const alwaysShowLines = new Set();
   const alwaysShowInlineComments = new Map();
+  const privateLines = new Set();
+  const privateInlineComments = new Map();
 
   for (const current of currentComments) {
     if (current.type === "block" && current.block) {
@@ -787,12 +799,29 @@ function stripComments(text, filePath, vcmComments = []) {
           alwaysShowLines.add(blockLine.originalLine);
         }
       }
-    } else if (current.type === "inline" && alwaysShowAnchors.has(current.anchor)) {
-      // For alwaysShow inline comments, store the line index and text
-      alwaysShowLines.add(current.originalLine);
-      alwaysShowInlineComments.set(current.originalLine, current.text || "");
+
+      // If this block is private and we're keeping private, add to private set
+      if (privateAnchors.has(current.anchor)) {
+        for (const blockLine of current.block) {
+          privateLines.add(blockLine.originalLine);
+        }
+      }
+    } else if (current.type === "inline") {
+      if (alwaysShowAnchors.has(current.anchor)) {
+        // For alwaysShow inline comments, store the line index and text
+        alwaysShowLines.add(current.originalLine);
+        alwaysShowInlineComments.set(current.originalLine, current.text || "");
+      }
+      if (privateAnchors.has(current.anchor)) {
+        // For private inline comments (if keeping), store the line index and text
+        privateLines.add(current.originalLine);
+        privateInlineComments.set(current.originalLine, current.text || "");
+      }
     }
   }
+
+  // Combine alwaysShow and private into comment maps for inline handling
+  const inlineCommentsToKeep = new Map([...alwaysShowInlineComments, ...privateInlineComments]);
 
   const lines = text.split("\n");
   const filteredLines = [];
@@ -801,8 +830,8 @@ function stripComments(text, filePath, vcmComments = []) {
     const line = lines[lineIndex];
     const trimmed = line.trim();
 
-    // Keep lines that are marked as alwaysShow (block comments)
-    if (alwaysShowLines.has(lineIndex)) {
+    // Keep lines that are marked as alwaysShow or private (if keeping private)
+    if (alwaysShowLines.has(lineIndex) || privateLines.has(lineIndex)) {
       filteredLines.push(line);
       continue;
     }
@@ -816,14 +845,14 @@ function stripComments(text, filePath, vcmComments = []) {
       continue;
     }
 
-    // Filter out pure comment lines (unless they're alwaysShow)
+    // Filter out pure comment lines (unless they're alwaysShow or private)
     if (lineStartPattern.test(trimmed)) {
       continue; // Skip this line
     }
 
     // This is a code line - check for inline comments
-    if (alwaysShowInlineComments.has(lineIndex)) {
-      // This line has an alwaysShow inline comment - keep the entire line
+    if (inlineCommentsToKeep.has(lineIndex)) {
+      // This line has an alwaysShow or private inline comment - keep the entire line
       filteredLines.push(line);
     } else {
       // Remove inline comments: everything after comment marker (if not in string)
@@ -1318,9 +1347,23 @@ async function activate(context) {
           existingByAnchor.get(key).push(existing);
         }
 
+        // Build a set of private comment anchors to exclude from extraction
+        const privateAnchors = new Set();
+        for (const privateComment of existingPrivateComments) {
+          const key = `${privateComment.type}:${privateComment.anchor}`;
+          privateAnchors.add(key);
+        }
+
         // Process current comments (typed in clean mode)
+        // IMPORTANT: Filter out private comments - they should never be added to shared VCM
         for (const current of currentComments) {
           const key = `${current.type}:${current.anchor}`;
+
+          // Skip if this is a private comment (visible in clean mode but should stay in private VCM)
+          if (privateAnchors.has(key)) {
+            continue;
+          }
+
           const candidates = existingByAnchor.get(key) || [];
 
           if (candidates.length > 0) {
@@ -1438,12 +1481,14 @@ async function activate(context) {
         // Source is in commented mode, show clean in split view
         // Load VCM comments to preserve alwaysShow metadata
         const { allComments: vcmComments } = await loadAllComments(relativePath);
-        showVersion = stripComments(text, doc.uri.path, vcmComments);
+        const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+        showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
       } else {
         // Source is in clean mode, show commented in split view
         // Load comments from VCM to inject
         const { allComments: comments } = await loadAllComments(relativePath);
-        showVersion = injectComments(text, comments);
+        const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+        showVersion = injectComments(text, comments, includePrivate);
       }
 
       // Update the split view content
@@ -1517,21 +1562,15 @@ async function activate(context) {
         await saveVCM(doc);
       }
 
-      // Load VCM comments to check for alwaysShow
-      let vcmComments = [];
-      try {
-        const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
-        vcmComments = vcmData.comments || [];
-      } catch {
-        // No VCM data available
-      }
+      // Load ALL VCM comments (shared + private) to check for alwaysShow and isPrivate
+      const { allComments: vcmComments } = await loadAllComments(relativePath);
 
-      // Strip comments to show clean version (but keep alwaysShow comments)
-      newText = stripComments(text, doc.uri.path, vcmComments);
+      // Strip comments to show clean version (but keep alwaysShow and private if visible)
+      const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+      newText = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
       // Mark this file as now in clean mode
       isCommentedMap.set(doc.uri.fsPath, false);
-      // When switching to clean mode, mark private comments as hidden (they're stripped)
-      privateCommentsVisible.set(doc.uri.fsPath, false);
+      // DO NOT change privateCommentsVisible - private comment visibility persists across mode toggles
       vscode.window.showInformationMessage("VCM: Switched to clean mode (comments hidden)");
     } else {
       // Currently in clean mode -> switch to commented mode (show comments)
@@ -1559,7 +1598,8 @@ async function activate(context) {
         });
 
         // Text is already in clean mode, so just inject comments directly
-        newText = injectComments(text, mergedComments);
+        const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+        newText = injectComments(text, mergedComments, includePrivate);
 
         // Save the merged VCM before toggling
         const updatedVcmData = {
@@ -1574,8 +1614,7 @@ async function activate(context) {
 
         // Mark this file as now in commented mode
         isCommentedMap.set(doc.uri.fsPath, true);
-        // When switching to commented mode, mark private comments as visible (if they exist, they'll be shown)
-        privateCommentsVisible.set(doc.uri.fsPath, true);
+        // DO NOT change privateCommentsVisible - private comment visibility persists across mode toggles
 
         // Mark that we just injected from VCM - don't re-extract on next save
         justInjectedFromVCM.add(doc.uri.fsPath);
@@ -1584,13 +1623,14 @@ async function activate(context) {
       } catch {
         // No .vcm file exists yet — create one now
         isCommentedMap.set(doc.uri.fsPath, true);
-        privateCommentsVisible.set(doc.uri.fsPath, true);
+        // DO NOT initialize privateCommentsVisible - it will default to false (hidden) if not set
         await saveVCM(doc);
         try {
           const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
-          // Strip comments before injecting (except alwaysShow)
-          const cleanText = stripComments(text, doc.uri.path, vcmData.comments || []);
-          newText = injectComments(cleanText, vcmData.comments || []);
+          // Strip comments before injecting (except alwaysShow and private if visible)
+          const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+          const cleanText = stripComments(text, doc.uri.path, vcmData.comments || [], keepPrivate);
+          newText = injectComments(cleanText, vcmData.comments || [], keepPrivate);
 
           // Mark that we just injected from VCM - don't re-extract on next save
           justInjectedFromVCM.add(doc.uri.fsPath);
@@ -2157,9 +2197,58 @@ async function activate(context) {
         // Save updated comments (will split into shared/private automatically)
         await saveCommentsToVCM(relativePath, comments);
 
-        vscode.window.showInformationMessage("VCM: Marked as Private 🔒");
+        // Check if private comments are currently visible
+        const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) === true;
+
+        if (!privateVisible) {
+          // Private mode is off, so hide this comment
+          // Find the comment lines to remove
+          const currentComments = extractComments(doc.getText(), doc.uri.path);
+          const currentComment = currentComments.find(c => c.anchor === anchorHash);
+
+          if (currentComment) {
+            const edit = new vscode.WorkspaceEdit();
+
+            if (currentComment.type === "block" && currentComment.block) {
+              // Remove the entire block
+              const firstLine = currentComment.block[0].originalLine;
+              const lastLine = currentComment.block[currentComment.block.length - 1].originalLine;
+              edit.delete(doc.uri, new vscode.Range(firstLine, 0, lastLine + 1, 0));
+            } else if (currentComment.type === "inline") {
+              // Remove inline comment from the line
+              const currentLine = doc.lineAt(currentComment.originalLine);
+              const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+              let commentStartIdx = -1;
+
+              for (const marker of commentMarkers) {
+                const idx = currentLine.text.indexOf(marker);
+                if (idx > 0 && currentLine.text[idx - 1].match(/\s/)) {
+                  commentStartIdx = idx - 1;
+                  break;
+                }
+              }
+
+              if (commentStartIdx >= 0) {
+                const newLineText = currentLine.text.substring(0, commentStartIdx).trimEnd();
+                edit.replace(doc.uri, currentLine.range, newLineText);
+              }
+            }
+
+            await vscode.workspace.applyEdit(edit);
+
+            // Mark that we just modified from marking private to prevent re-extraction
+            justInjectedFromVCM.add(doc.uri.fsPath);
+
+            await vscode.commands.executeCommand("workbench.action.files.save");
+          }
+
+          vscode.window.showInformationMessage("VCM: Private comment hidden 🔒 Toggle Private Comments to view.");
+        } else {
+          vscode.window.showInformationMessage("VCM: Marked as Private 🔒");
+        }
+
         // Update context to refresh menu items
-        await updateAlwaysShowContext();
+        setTimeout(() => updateAlwaysShowContext(), 100);
       } catch (err) {
         vscode.window.showErrorMessage("VCM: Error marking comment as Private: " + err.message);
       }
@@ -2317,7 +2406,7 @@ async function activate(context) {
 
         // Check if we need to remove the comment from the document
         const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
-        const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) !== false;
+        const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) === true;
 
         // Remove from document if:
         // 1. In clean mode with private visible (comment is visible but shouldn't be after unmarking)
@@ -2408,8 +2497,14 @@ async function activate(context) {
           return;
         }
 
-        // Check current visibility state
-        const currentlyVisible = privateCommentsVisible.get(doc.uri.fsPath) !== false; // default to true
+        // Check current visibility state by detecting if private comments are in the document
+        // Extract current comments and check if any private ones are present
+        const currentComments = extractComments(text, doc.uri.path);
+        const privateAnchors = new Set(privateComments.map(c => c.anchor));
+        const privateCommentsInDoc = currentComments.some(c => privateAnchors.has(c.anchor));
+
+        // Use document state as source of truth, fallback to stored state
+        const currentlyVisible = privateCommentsInDoc || (privateCommentsVisible.get(doc.uri.fsPath) === true);
 
         let newText;
         if (currentlyVisible) {
@@ -2471,10 +2566,8 @@ async function activate(context) {
           vscode.window.showInformationMessage("VCM: Private comments hidden 🔒");
         } else {
           // Show private comments - inject them back
-          // Since injectComments now filters out private, we need to inject manually
-          // or temporarily remove the isPrivate flag
-          const commentsToInject = privateComments.map(c => ({ ...c, isPrivate: false }));
-          newText = injectComments(text, commentsToInject);
+          // Pass true to includePrivate to inject them
+          newText = injectComments(text, privateComments, true);
 
           privateCommentsVisible.set(doc.uri.fsPath, true);
 
@@ -2530,8 +2623,9 @@ async function activate(context) {
 
     // Create clean version and version with comments
     const text = doc.getText();
-    const clean = stripComments(text, doc.uri.path, comments);
-    const withComments = injectComments(clean, comments);
+    const keepPrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
+    const clean = stripComments(text, doc.uri.path, comments, keepPrivate);
+    const withComments = injectComments(clean, comments, keepPrivate);
 
     // Detect initial state if not already set
     if (!isCommentedMap.has(doc.uri.fsPath)) {
