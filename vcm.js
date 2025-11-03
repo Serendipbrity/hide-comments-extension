@@ -573,11 +573,27 @@ function injectComments(cleanText, comments) {
           result.push(c.text);
         }
 
-        // Add trailing blank lines if they exist (blank lines between comment and code)
-        if (block.trailingBlankLines) {
-          for (let j = 0; j < block.trailingBlankLines; j++) {
-            result.push("");
+        // Handle trailing blank lines intelligently:
+        // Check if there are already blank lines in the clean text between the comment and code
+        if (block.trailingBlankLines && block.trailingBlankLines > 0) {
+          // Count how many blank lines exist in the clean text starting from current position
+          let existingBlanks = 0;
+          for (let j = i; j < lines.length && existingBlanks < block.trailingBlankLines; j++) {
+            if (!lines[j].trim()) {
+              existingBlanks++;
+            } else {
+              break; // Hit code, stop counting
+            }
           }
+
+          // If there are fewer blanks in clean text than we need, add the difference
+          if (existingBlanks < block.trailingBlankLines) {
+            for (let j = 0; j < block.trailingBlankLines - existingBlanks; j++) {
+              result.push("");
+            }
+          }
+          // If there are already enough blanks, we'll skip over them when processing lines
+          // This prevents duplication
         }
       }
     }
@@ -703,6 +719,7 @@ function stripComments(text, filePath, vcmComments = []) {
 
   // Build sets for tracking lines
   const allCommentBlockLines = new Set();
+  const trailingBlankLines = new Set(); // Track blank lines after comments (to remove)
   const alwaysShowLines = new Set();
   const alwaysShowInlineComments = new Map();
 
@@ -713,10 +730,25 @@ function stripComments(text, filePath, vcmComments = []) {
         allCommentBlockLines.add(blockLine.originalLine);
       }
 
-      // If this block is alwaysShow, also add to alwaysShow set
+      // Track trailing blank lines after this comment block (to remove them)
+      if (current.trailingBlankLines && current.trailingBlankLines > 0) {
+        const lastCommentLine = current.block[current.block.length - 1].originalLine;
+        for (let j = 1; j <= current.trailingBlankLines; j++) {
+          trailingBlankLines.add(lastCommentLine + j);
+        }
+      }
+
+      // If this block is alwaysShow, also add to alwaysShow set (including trailing blanks)
       if (alwaysShowAnchors.has(current.anchor)) {
         for (const blockLine of current.block) {
           alwaysShowLines.add(blockLine.originalLine);
+        }
+        // Also add trailing blank lines for alwaysShow comments
+        if (current.trailingBlankLines && current.trailingBlankLines > 0) {
+          const lastCommentLine = current.block[current.block.length - 1].originalLine;
+          for (let j = 1; j <= current.trailingBlankLines; j++) {
+            alwaysShowLines.add(lastCommentLine + j);
+          }
         }
       }
     } else if (current.type === "inline" && alwaysShowAnchors.has(current.anchor)) {
@@ -739,9 +771,9 @@ function stripComments(text, filePath, vcmComments = []) {
       continue;
     }
 
-    // Keep blank lines UNLESS they're part of a comment block
+    // Keep blank lines UNLESS they're part of a comment block OR trailing blanks after comments
     if (!trimmed) {
-      if (!allCommentBlockLines.has(lineIndex)) {
+      if (!allCommentBlockLines.has(lineIndex) && !trailingBlankLines.has(lineIndex)) {
         filteredLines.push(line);
       }
       continue;
