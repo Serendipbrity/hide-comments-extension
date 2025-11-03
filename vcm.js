@@ -2294,8 +2294,10 @@ async function activate(context) {
         // If in commented mode with private visible, comment stays in document (moved to shared)
 
         vscode.window.showInformationMessage("VCM: Unmarked Private ✅");
-        // Update context to refresh menu items
-        await updateAlwaysShowContext();
+        // Update context to refresh menu items (with small delay to ensure file writes complete)
+        setTimeout(async () => {
+          await updateAlwaysShowContext();
+        }, 100);
       } catch (err) {
         vscode.window.showErrorMessage("VCM: No .vcm file found. Try saving first.");
       }
