@@ -1337,41 +1337,53 @@ async function activate(context) {
       if (wasJustInjected) {
         finalComments = existingComments;
       } else {
-        // Build a map of existing comments by anchor for matching
-        const existingByAnchor = new Map();
+        // Build a map of existing comments by anchor + context hashes for matching
+        const existingByKey = new Map();
         for (const existing of existingComments) {
-          const key = `${existing.type}:${existing.anchor}`;
-          if (!existingByAnchor.has(key)) {
-            existingByAnchor.set(key, []);
+          const key = `${existing.type}:${existing.anchor}:${existing.prevHash || 'null'}:${existing.nextHash || 'null'}`;
+          if (!existingByKey.has(key)) {
+            existingByKey.set(key, []);
           }
-          existingByAnchor.get(key).push(existing);
+          existingByKey.get(key).push(existing);
         }
 
-        // Build a set of private comment anchors to exclude from extraction
-        const privateAnchors = new Set();
+        // Build a set of private comment keys using anchor + context hashes
+        const privateKeys = new Set();
         for (const privateComment of existingPrivateComments) {
-          const key = `${privateComment.type}:${privateComment.anchor}`;
-          privateAnchors.add(key);
+          const key = `${privateComment.type}:${privateComment.anchor}:${privateComment.prevHash || 'null'}:${privateComment.nextHash || 'null'}`;
+          privateKeys.add(key);
         }
 
         // Process current comments (typed in clean mode)
         // IMPORTANT: Filter out private comments - they should never be added to shared VCM
         for (const current of currentComments) {
-          const key = `${current.type}:${current.anchor}`;
+          const key = `${current.type}:${current.anchor}:${current.prevHash || 'null'}:${current.nextHash || 'null'}`;
 
           // Skip if this is a private comment (visible in clean mode but should stay in private VCM)
-          if (privateAnchors.has(key)) {
+          if (privateKeys.has(key)) {
             continue;
           }
 
-          const candidates = existingByAnchor.get(key) || [];
+          const candidates = existingByKey.get(key) || [];
 
           if (candidates.length > 0) {
             // Found matching existing comment - update its text_cleanMode
             const existing = candidates[0]; // Use first match (could improve with context matching)
 
             if (current.type === "inline") {
-              existing.text_cleanMode = current.text;
+              // For inline comments, accumulate in text_cleanMode
+              // Each new comment typed in clean mode gets appended
+              const currentText = current.text || "";
+              const previousCleanModeText = existing.text_cleanMode || "";
+
+              // Check if this exact text is already in text_cleanMode
+              if (!previousCleanModeText.includes(currentText.trim())) {
+                // Prepend new comment to existing clean mode text
+                existing.text_cleanMode = currentText + previousCleanModeText;
+              } else {
+                // Already have this comment, keep as is
+                existing.text_cleanMode = previousCleanModeText;
+              }
             } else if (current.type === "block") {
               // For block comments, store the block array in text_cleanMode
               existing.text_cleanMode = current.block;
@@ -1470,7 +1482,7 @@ async function activate(context) {
     const doc = e.document;
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
 
-    // Debounce updates to prevent multiple rapid injections
+    // Debounce updates to prevent multiple rapid injections during undo/redo
     clearTimeout(splitViewUpdateTimeout);
     splitViewUpdateTimeout = setTimeout(async () => {
       try {
@@ -1489,10 +1501,15 @@ async function activate(context) {
           showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
         } else {
           // Source is in clean mode, show commented in split view
-          // Load comments from VCM to inject
+          // First strip any comments typed in clean mode, then inject VCM comments
           const { allComments: comments } = await loadAllComments(relativePath);
           const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
-          showVersion = injectComments(text, comments, includePrivate);
+
+          // Strip comments from clean text first (to remove comments typed in clean mode)
+          const cleanText = stripComments(text, doc.uri.path, comments, false);
+
+          // Then inject VCM comments
+          showVersion = injectComments(cleanText, comments, includePrivate);
         }
 
         // Update the split view content
@@ -1500,7 +1517,7 @@ async function activate(context) {
       } catch (err) {
         // Ignore errors - VCM might not exist yet
       }
-    }, 100); // Small debounce delay to prevent rapid duplicate updates
+    }, 300); // Longer debounce to handle rapid undo/redo operations
   });
   context.subscriptions.push(splitViewSyncWatcher);
 
@@ -1602,9 +1619,10 @@ async function activate(context) {
           return merged;
         });
 
-        // Text is already in clean mode, so just inject comments directly
+        // Strip any comments typed in clean mode before injecting VCM comments
+        const cleanText = stripComments(text, doc.uri.path, mergedComments, false);
         const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
-        newText = injectComments(text, mergedComments, includePrivate);
+        newText = injectComments(cleanText, mergedComments, includePrivate);
 
         // Save the merged VCM before toggling
         const updatedVcmData = {
@@ -2064,134 +2082,50 @@ async function activate(context) {
       const relativePath = vscode.workspace.asRelativePath(doc.uri);
 
       try {
-        // Find the anchor hash for this comment
-        const lines = doc.getText().split("\n");
-        let anchorHash;
+        // Extract current comments to get the comment at cursor with its hashes
+        const currentComments = extractComments(doc.getText(), doc.uri.path);
 
-        if (isInlineComment) {
-          // For inline comments, the anchor is the code portion before the comment
-          // Find where the comment starts and hash only the code part
-          let commentStartIndex = -1;
-          for (const marker of commentMarkers) {
-            const markerRegex = new RegExp(`(\\s+)(${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`);
-            const match = text.match(markerRegex);
-            if (match) {
-              commentStartIndex = match.index;
-              break;
-            }
-          }
-          if (commentStartIndex > 0) {
-            const anchorBase = text.substring(0, commentStartIndex).trimEnd();
-            anchorHash = hashLine(anchorBase, 0);
+        // Find the comment at the cursor position to get its hashes
+        const commentAtCursor = currentComments.find(c => {
+          if (isInlineComment) {
+            return c.type === "inline" && c.originalLine === selectedLine;
           } else {
-            vscode.window.showErrorMessage("VCM: Could not find comment marker.");
-            return;
-          }
-        } else {
-          // For block comments, find the next non-comment line
-          let anchorLineIndex = -1;
-          for (let i = selectedLine + 1; i < lines.length; i++) {
-            const trimmed = lines[i].trim();
-            if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
-              anchorLineIndex = i;
-              break;
+            // For block comments, check if cursor is within the block
+            if (c.type === "block" && c.block) {
+              const firstLine = c.block[0].originalLine;
+              const lastLine = c.block[c.block.length - 1].originalLine;
+              return selectedLine >= firstLine && selectedLine <= lastLine;
             }
+            return false;
           }
+        });
 
-          // If no code line below, fallback to the previous code line
-          if (anchorLineIndex === -1) {
-            for (let i = selectedLine - 1; i >= 0; i--) {
-              const trimmed = lines[i].trim();
-              if (trimmed && !trimmed.match(/^(\s*)(#|\/\/|--|%|;)/)) {
-                anchorLineIndex = i;
-                break;
-              }
-            }
-          }
-
-          if (anchorLineIndex === -1) {
-            vscode.window.showErrorMessage("VCM: Could not determine anchor line for this comment.");
-            return;
-          }
-
-          anchorHash = hashLine(lines[anchorLineIndex], 0);
+        if (!commentAtCursor) {
+          vscode.window.showWarningMessage("VCM: Could not find a matching comment entry.");
+          return;
         }
+
+        // Build the key using ALL hashes for this comment
+        const commentKey = `${commentAtCursor.type}:${commentAtCursor.anchor}:${commentAtCursor.prevHash || 'null'}:${commentAtCursor.nextHash || 'null'}`;
 
         // Load or create VCM comments
         let comments = [];
         const { allComments } = await loadAllComments(relativePath);
 
         if (allComments.length === 0) {
-          // No VCM exists - extract only the specific comment being marked
-          const allExtractedComments = extractComments(doc.getText(), doc.uri.path);
-
-          // Find all comments with matching anchor
-          const candidates = allExtractedComments.filter(c => c.anchor === anchorHash);
-
-          if (candidates.length === 0) {
-            vscode.window.showWarningMessage("VCM: Could not find a matching comment entry.");
-            return;
-          }
-
-          let targetComment;
-          if (candidates.length === 1) {
-            targetComment = candidates[0];
-          } else {
-            // Multiple comments with same anchor - use line number to disambiguate
-            targetComment = candidates.find(c => c.originalLine === selectedLine);
-            if (!targetComment) {
-              targetComment = candidates[0]; // Fallback to first match
-            }
-          }
-
-          // Only add this one comment to VCM, marked as private
-          targetComment.isPrivate = true;
-          comments = [targetComment];
+          // No VCM exists - add only this comment to VCM, marked as private
+          commentAtCursor.isPrivate = true;
+          comments = [commentAtCursor];
         } else {
-          // VCM exists - mark the comment in existing list using context matching
+          // VCM exists - find and mark the matching comment using ALL hashes
           comments = allComments;
 
-          // Extract current comments to get fresh prevHash/nextHash
-          const currentComments = extractComments(doc.getText(), doc.uri.path);
-          const currentCandidates = currentComments.filter(c => c.anchor === anchorHash);
+          const targetVcmComment = comments.find(vcm => {
+            const vcmKey = `${vcm.type}:${vcm.anchor}:${vcm.prevHash || 'null'}:${vcm.nextHash || 'null'}`;
+            return vcmKey === commentKey;
+          });
 
-          if (currentCandidates.length === 0) {
-            vscode.window.showWarningMessage("VCM: Could not find a matching comment entry in current file.");
-            return;
-          }
-
-          // Find the current comment at the selected line
-          let currentComment = currentCandidates.find(c => c.originalLine === selectedLine);
-          if (!currentComment && currentCandidates.length > 0) {
-            currentComment = currentCandidates[0]; // Fallback
-          }
-
-          // Now match this current comment to a VCM comment using context
-          const vcmCandidates = comments.filter(c => c.anchor === anchorHash);
-          let targetVcmComment;
-
-          if (vcmCandidates.length === 1) {
-            targetVcmComment = vcmCandidates[0];
-          } else if (vcmCandidates.length > 1) {
-            // Use context hashes to find best match
-            let bestMatch = null;
-            let bestScore = -1;
-
-            for (const vcm of vcmCandidates) {
-              let score = 0;
-              if (currentComment.prevHash && vcm.prevHash === currentComment.prevHash) {
-                score += 10;
-              }
-              if (currentComment.nextHash && vcm.nextHash === currentComment.nextHash) {
-                score += 10;
-              }
-              if (score > bestScore) {
-                bestScore = score;
-                bestMatch = vcm;
-              }
-            }
-            targetVcmComment = bestMatch || vcmCandidates[0];
-          } else {
+          if (!targetVcmComment) {
             vscode.window.showWarningMessage("VCM: Could not find a matching comment entry in .vcm.");
             return;
           }
@@ -2206,22 +2140,18 @@ async function activate(context) {
         const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) === true;
 
         if (!privateVisible) {
-          // Private mode is off, so hide this comment
-          // Find the comment lines to remove
-          const currentComments = extractComments(doc.getText(), doc.uri.path);
-          const currentComment = currentComments.find(c => c.anchor === anchorHash);
-
-          if (currentComment) {
+          // Private mode is off, so hide this comment (we already have it in commentAtCursor)
+          if (commentAtCursor) {
             const edit = new vscode.WorkspaceEdit();
 
-            if (currentComment.type === "block" && currentComment.block) {
+            if (commentAtCursor.type === "block" && commentAtCursor.block) {
               // Remove the entire block
-              const firstLine = currentComment.block[0].originalLine;
-              const lastLine = currentComment.block[currentComment.block.length - 1].originalLine;
+              const firstLine = commentAtCursor.block[0].originalLine;
+              const lastLine = commentAtCursor.block[commentAtCursor.block.length - 1].originalLine;
               edit.delete(doc.uri, new vscode.Range(firstLine, 0, lastLine + 1, 0));
-            } else if (currentComment.type === "inline") {
+            } else if (commentAtCursor.type === "inline") {
               // Remove inline comment from the line
-              const currentLine = doc.lineAt(currentComment.originalLine);
+              const currentLine = doc.lineAt(commentAtCursor.originalLine);
               const commentMarkers = getCommentMarkersForFile(doc.uri.path);
               let commentStartIdx = -1;
 
@@ -2508,8 +2438,12 @@ async function activate(context) {
         // Check current visibility state by detecting if private comments are in the document
         // Extract current comments and check if any private ones are present
         const currentComments = extractComments(text, doc.uri.path);
-        const privateAnchors = new Set(privateComments.map(c => c.anchor));
-        const privateCommentsInDoc = currentComments.some(c => privateAnchors.has(c.anchor));
+        const privateKeys = new Set(privateComments.map(c =>
+          `${c.type}:${c.anchor}:${c.prevHash || 'null'}:${c.nextHash || 'null'}`
+        ));
+        const privateCommentsInDoc = currentComments.some(c =>
+          privateKeys.has(`${c.type}:${c.anchor}:${c.prevHash || 'null'}:${c.nextHash || 'null'}`)
+        );
 
         // Determine current visibility state
         // If we have an explicit stored state, use it
@@ -2519,8 +2453,10 @@ async function activate(context) {
 
         let newText;
         if (currentlyVisible) {
-          // Hide private comments - remove ONLY private comments using anchor hashes
-          const privateAnchors = new Set(privateComments.map(c => c.anchor));
+          // Hide private comments - remove ONLY private comments using anchor + context hashes
+          const privateKeys = new Set(privateComments.map(c =>
+            `${c.type}:${c.anchor}:${c.prevHash || 'null'}:${c.nextHash || 'null'}`
+          ));
 
           // Extract current comments to identify which ones are private
           const currentComments = extractComments(text, doc.uri.path);
@@ -2530,7 +2466,8 @@ async function activate(context) {
           const privateInlinesToRemove = [];
 
           for (const current of currentComments) {
-            if (privateAnchors.has(current.anchor)) {
+            const currentKey = `${current.type}:${current.anchor}:${current.prevHash || 'null'}:${current.nextHash || 'null'}`;
+            if (privateKeys.has(currentKey)) {
               if (current.type === "block") {
                 privateBlocksToRemove.push(current);
               } else if (current.type === "inline") {
