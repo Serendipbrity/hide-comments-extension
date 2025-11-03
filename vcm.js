@@ -379,9 +379,20 @@ function extractComments(text, filePath) {
     // CASE 3: We have buffered comment lines above this code line
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
-      // Count blank lines between the last comment and this code line
+      // Count blank lines BEFORE the first comment line
+      const firstCommentLine = commentBuffer[0].originalLine;
+      let leadingBlankLines = 0;
+      for (let j = firstCommentLine - 1; j >= 0; j--) {
+        if (!lines[j].trim()) {
+          leadingBlankLines++;
+        } else {
+          break; // Hit code or another comment
+        }
+      }
+
+      // Count blank lines AFTER the last comment (between comment and this code line)
       const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLine;
-      const blankLinesBetween = i - lastCommentLine - 1;
+      const trailingBlankLines = i - lastCommentLine - 1;
 
       // Store context: previous code line and next code line
       const prevIdx = findPrevCodeLine(i);
@@ -394,7 +405,8 @@ function extractComments(text, filePath) {
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         insertAbove: true,
         block: commentBuffer,
-        trailingBlankLines: blankLinesBetween > 0 ? blankLinesBetween : undefined,
+        leadingBlankLines: leadingBlankLines > 0 ? leadingBlankLines : undefined,
+        trailingBlankLines: trailingBlankLines > 0 ? trailingBlankLines : undefined,
       });
       commentBuffer = []; // Clear buffer for next block
     }
@@ -548,13 +560,65 @@ function injectComments(cleanText, comments) {
     }
   }
 
-  // Rebuild the file line by line
+  // First pass: identify which blank lines belong to comment spacing
+  const blankLinesOwnedByComments = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const blocks = blockMap.get(i);
+    if (blocks) {
+      for (const block of blocks) {
+        const leadingBlanks = block.leadingBlankLines || 0;
+        const trailingBlanks = block.trailingBlankLines || 0;
+        const totalBlanks = leadingBlanks + trailingBlanks;
+
+        // Find all consecutive blank lines before the anchor
+        const blankIndices = [];
+        for (let j = i - 1; j >= 0; j--) {
+          if (!lines[j].trim()) {
+            blankIndices.unshift(j); // Add to front to maintain order
+          } else {
+            break;
+          }
+        }
+
+        // Mark the appropriate blanks:
+        // First N are leading, next M are trailing
+        for (let idx = 0; idx < Math.min(blankIndices.length, totalBlanks); idx++) {
+          blankLinesOwnedByComments.add(blankIndices[idx]);
+        }
+      }
+    }
+  }
+
+  // Second pass: rebuild the file
   for (let i = 0; i < lines.length; i++) {
     // STEP 1: Insert any block comments anchored to this line
     // These go ABOVE the code line
     const blocks = blockMap.get(i);
     if (blocks) {
       for (const block of blocks) {
+        const leadingBlanks = block.leadingBlankLines || 0;
+        const trailingBlanks = block.trailingBlankLines || 0;
+
+        // Collect all consecutive blank lines before the anchor
+        const allBlankLines = [];
+        for (let j = i - 1; j >= 0; j--) {
+          if (!lines[j].trim()) {
+            allBlankLines.unshift(lines[j]); // Add to front to maintain order
+          } else {
+            break;
+          }
+        }
+
+        // Split them: first N are leading, next M are trailing
+        const leadingBlankLines = allBlankLines.slice(0, leadingBlanks);
+        const trailingBlankLines = allBlankLines.slice(leadingBlanks, leadingBlanks + trailingBlanks);
+
+        // Add leading blanks
+        for (const blank of leadingBlankLines) {
+          result.push(blank);
+        }
+
         // Combine text_cleanMode (if it's a block array) and block
         let allBlockLines = [];
 
@@ -573,29 +637,16 @@ function injectComments(cleanText, comments) {
           result.push(c.text);
         }
 
-        // Handle trailing blank lines intelligently:
-        // Check if there are already blank lines in the clean text between the comment and code
-        if (block.trailingBlankLines && block.trailingBlankLines > 0) {
-          // Count how many blank lines exist in the clean text starting from current position
-          let existingBlanks = 0;
-          for (let j = i; j < lines.length && existingBlanks < block.trailingBlankLines; j++) {
-            if (!lines[j].trim()) {
-              existingBlanks++;
-            } else {
-              break; // Hit code, stop counting
-            }
-          }
-
-          // If there are fewer blanks in clean text than we need, add the difference
-          if (existingBlanks < block.trailingBlankLines) {
-            for (let j = 0; j < block.trailingBlankLines - existingBlanks; j++) {
-              result.push("");
-            }
-          }
-          // If there are already enough blanks, we'll skip over them when processing lines
-          // This prevents duplication
+        // Add trailing blanks
+        for (const blank of trailingBlankLines) {
+          result.push(blank);
         }
       }
+    }
+
+    // Skip blank lines that are owned by comments (we already added them with the comment)
+    if (blankLinesOwnedByComments.has(i)) {
+      continue;
     }
 
     // STEP 2: Add the code line itself
@@ -719,36 +770,21 @@ function stripComments(text, filePath, vcmComments = []) {
 
   // Build sets for tracking lines
   const allCommentBlockLines = new Set();
-  const trailingBlankLines = new Set(); // Track blank lines after comments (to remove)
   const alwaysShowLines = new Set();
   const alwaysShowInlineComments = new Map();
 
   for (const current of currentComments) {
     if (current.type === "block" && current.block) {
-      // Track all lines in all comment blocks (including blank lines within them)
+      // Track all lines in all comment blocks (including blank lines WITHIN them)
+      // But DO NOT track leading/trailing blank lines - those should stay visible in ALL modes
       for (const blockLine of current.block) {
         allCommentBlockLines.add(blockLine.originalLine);
       }
 
-      // Track trailing blank lines after this comment block (to remove them)
-      if (current.trailingBlankLines && current.trailingBlankLines > 0) {
-        const lastCommentLine = current.block[current.block.length - 1].originalLine;
-        for (let j = 1; j <= current.trailingBlankLines; j++) {
-          trailingBlankLines.add(lastCommentLine + j);
-        }
-      }
-
-      // If this block is alwaysShow, also add to alwaysShow set (including trailing blanks)
+      // If this block is alwaysShow, also add to alwaysShow set
       if (alwaysShowAnchors.has(current.anchor)) {
         for (const blockLine of current.block) {
           alwaysShowLines.add(blockLine.originalLine);
-        }
-        // Also add trailing blank lines for alwaysShow comments
-        if (current.trailingBlankLines && current.trailingBlankLines > 0) {
-          const lastCommentLine = current.block[current.block.length - 1].originalLine;
-          for (let j = 1; j <= current.trailingBlankLines; j++) {
-            alwaysShowLines.add(lastCommentLine + j);
-          }
         }
       }
     } else if (current.type === "inline" && alwaysShowAnchors.has(current.anchor)) {
@@ -771,9 +807,10 @@ function stripComments(text, filePath, vcmComments = []) {
       continue;
     }
 
-    // Keep blank lines UNLESS they're part of a comment block OR trailing blanks after comments
+    // Keep blank lines UNLESS they're part of a comment block (i.e., blank lines BETWEEN comment lines)
+    // Blank lines before/after comments should ALWAYS be kept
     if (!trimmed) {
-      if (!allCommentBlockLines.has(lineIndex) && !trailingBlankLines.has(lineIndex)) {
+      if (!allCommentBlockLines.has(lineIndex)) {
         filteredLines.push(line);
       }
       continue;
