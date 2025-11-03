@@ -2237,18 +2237,17 @@ async function activate(context) {
         // Save updated comments (will split into shared/private automatically)
         await saveCommentsToVCM(relativePath, comments);
 
-        // Check if we're in clean mode OR if private comments are hidden
-        // In these cases, the comment is not currently visible in the document
+        // Check if we need to remove the comment from the document
         const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
         const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) !== false;
 
-        // Only remove from document if in clean mode (comments not visible)
-        if (!isInCommentedMode) {
-          // We're in clean mode - the private comment was not visible anyway
-          // No need to remove anything from the document
-        } else if (!privateVisible) {
-          // We're in commented mode but private comments are hidden
-          // Remove the comment from the document since it was only visible because it was private
+        // Remove from document if:
+        // 1. In clean mode with private visible (comment is visible but shouldn't be after unmarking)
+        // 2. In commented mode with private hidden (comment was visible only because it was private)
+        const shouldRemove = (!isInCommentedMode && privateVisible) || (isInCommentedMode && !privateVisible);
+
+        if (shouldRemove) {
+          // Remove the comment from the document
           const edit = new vscode.WorkspaceEdit();
 
           // Use the currentComment we already found
