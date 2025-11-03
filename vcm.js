@@ -312,9 +312,6 @@ function extractComments(text, filePath) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    
-    // Skip blank lines - they don't affect comment grouping
-    if (!trimmed) continue;
 
     // CASE 1: This line is a standalone comment
     if (isComment(line)) {
@@ -324,6 +321,32 @@ function extractComments(text, filePath) {
         originalLine: i,      // 0-based line index
       });
       continue; // Move to next line, stay in comment-gathering mode
+    }
+
+    // CASE 1.5: Blank line - check if it's within a comment block
+    if (!trimmed) {
+      // If we have comments buffered, check if the next non-blank line is also a comment
+      if (commentBuffer.length > 0) {
+        // Look ahead to find the next non-blank line
+        let nextNonBlankIdx = -1;
+        for (let j = i + 1; j < lines.length; j++) {
+          if (lines[j].trim()) {
+            nextNonBlankIdx = j;
+            break;
+          }
+        }
+
+        // If the next non-blank line is a comment, this blank line is part of the block
+        if (nextNonBlankIdx >= 0 && isComment(lines[nextNonBlankIdx])) {
+          commentBuffer.push({
+            text: line,           // Empty or whitespace-only line
+            originalLine: i,      // 0-based line index
+          });
+          continue;
+        }
+      }
+      // Otherwise, skip this blank line (it's between blocks or code sections)
+      continue;
     }
 
     // CASE 2: This line is code - check for inline comment(s)
@@ -663,43 +686,31 @@ function stripComments(text, filePath, vcmComments = []) {
     }
   }
 
-  // If there are no alwaysShow comments, use the simple stripping logic
-  if (alwaysShowAnchors.size === 0) {
-    return text
-      .split("\n")
-      .filter(line => {
-        const trimmed = line.trim();
-        return !trimmed || !lineStartPattern.test(trimmed);
-      })
-      .map(line => {
-        const commentPos = findCommentStart(line);
-        if (commentPos >= 0) {
-          return line.substring(0, commentPos).trimEnd();
-        }
-        return line;
-      })
-      .join("\n");
-  }
-
-  // Extract current comments to identify which ones are alwaysShow by matching anchors
+  // Extract current comments to identify blank lines within comment blocks
   const currentComments = extractComments(text, filePath);
 
-  // Build a set of line indices that contain alwaysShow comments
+  // Build sets for tracking lines
+  const allCommentBlockLines = new Set();
   const alwaysShowLines = new Set();
   const alwaysShowInlineComments = new Map();
 
   for (const current of currentComments) {
-    if (alwaysShowAnchors.has(current.anchor)) {
-      if (current.type === "block" && current.block) {
-        // For block comments, add all line indices in the block
+    if (current.type === "block" && current.block) {
+      // Track all lines in all comment blocks (including blank lines within them)
+      for (const blockLine of current.block) {
+        allCommentBlockLines.add(blockLine.originalLine);
+      }
+
+      // If this block is alwaysShow, also add to alwaysShow set
+      if (alwaysShowAnchors.has(current.anchor)) {
         for (const blockLine of current.block) {
           alwaysShowLines.add(blockLine.originalLine);
         }
-      } else if (current.type === "inline") {
-        // For inline comments, store the line index and text
-        alwaysShowLines.add(current.originalLine);
-        alwaysShowInlineComments.set(current.originalLine, current.text || "");
       }
+    } else if (current.type === "inline" && alwaysShowAnchors.has(current.anchor)) {
+      // For alwaysShow inline comments, store the line index and text
+      alwaysShowLines.add(current.originalLine);
+      alwaysShowInlineComments.set(current.originalLine, current.text || "");
     }
   }
 
@@ -710,15 +721,17 @@ function stripComments(text, filePath, vcmComments = []) {
     const line = lines[lineIndex];
     const trimmed = line.trim();
 
-    // Keep blank lines
-    if (!trimmed) {
+    // Keep lines that are marked as alwaysShow (block comments)
+    if (alwaysShowLines.has(lineIndex)) {
       filteredLines.push(line);
       continue;
     }
 
-    // Keep lines that are marked as alwaysShow (block comments)
-    if (alwaysShowLines.has(lineIndex)) {
-      filteredLines.push(line);
+    // Keep blank lines UNLESS they're part of a comment block
+    if (!trimmed) {
+      if (!allCommentBlockLines.has(lineIndex)) {
+        filteredLines.push(line);
+      }
       continue;
     }
 
@@ -1082,9 +1095,9 @@ async function activate(context) {
       //   → The user is editing the commented version.
       //   → Replace entire VCM with what's currently visible.
       //   → Always extract current state to detect deletions immediately.
-      //   → PRESERVE metadata like alwaysShow from existing comments.
+      //   → PRESERVE metadata like alwaysShow and isPrivate from existing comments.
 
-      // Build a map of existing comments with their metadata
+      // Build a map of existing SHARED comments with their metadata
       const existingByKey = new Map();
       const existingByText = new Map(); // Secondary index by text for anchor updates
       for (const existing of existingComments) {
@@ -1098,6 +1111,23 @@ async function activate(context) {
         const textKey = existing.text || (existing.block ? existing.block.map(b => b.text).join('\n') : '');
         if (textKey && !existingByText.has(textKey)) {
           existingByText.set(textKey, existing);
+        }
+      }
+
+      // Build a map of existing PRIVATE comments (to preserve isPrivate flag)
+      const privateByKey = new Map();
+      const privateByText = new Map();
+      for (const privateComment of existingPrivateComments) {
+        const key = `${privateComment.type}:${privateComment.anchor}`;
+        if (!privateByKey.has(key)) {
+          privateByKey.set(key, []);
+        }
+        privateByKey.get(key).push(privateComment);
+
+        // Also index by text
+        const textKey = privateComment.text || (privateComment.block ? privateComment.block.map(b => b.text).join('\n') : '');
+        if (textKey && !privateByText.has(textKey)) {
+          privateByText.set(textKey, privateComment);
         }
       }
 
@@ -1117,6 +1147,27 @@ async function activate(context) {
       // Start with updated current comments (preserving metadata)
       finalComments = currentComments.map(current => {
         const key = `${current.type}:${current.anchor}`;
+        const currentText = current.text || (current.block ? current.block.map(b => b.text).join('\n') : '');
+
+        // First check if this is a private comment
+        const privateCandidates = privateByKey.get(key) || [];
+        if (privateCandidates.length > 0) {
+          // This is a private comment - mark it as such
+          return {
+            ...current,
+            isPrivate: true,
+          };
+        }
+
+        // Also check by text in case anchor changed
+        if (currentText && privateByText.has(currentText)) {
+          return {
+            ...current,
+            isPrivate: true,
+          };
+        }
+
+        // Not private - check shared comments for metadata
         const candidates = existingByKey.get(key) || [];
 
         if (candidates.length > 0) {
@@ -1136,7 +1187,6 @@ async function activate(context) {
         }
 
         // No match by anchor - try matching by text (anchor might have changed)
-        const currentText = current.text || (current.block ? current.block.map(b => b.text).join('\n') : '');
         if (currentText && existingByText.has(currentText)) {
           const existing = existingByText.get(currentText);
           if (!matchedExisting.has(existing)) {
@@ -1237,9 +1287,20 @@ async function activate(context) {
     // ------------------------------------------------------------------------
     // Save final comments, splitting into shared and private files
     // ------------------------------------------------------------------------
-    // IMPORTANT: Always preserve private comments from the private VCM file
-    // They should never be overwritten during extraction/merging
-    const finalCommentsWithPrivate = [...finalComments, ...existingPrivateComments];
+    // Add private comments that aren't already in finalComments
+    // (They might already be there if private comments were visible and got extracted)
+    const finalCommentsSet = new Set(finalComments.map(c => {
+      const text = c.text || (c.block ? c.block.map(b => b.text).join('\n') : '');
+      return `${c.type}:${c.anchor}:${text}`;
+    }));
+
+    const missingPrivateComments = existingPrivateComments.filter(pc => {
+      const text = pc.text || (pc.block ? pc.block.map(b => b.text).join('\n') : '');
+      const key = `${pc.type}:${pc.anchor}:${text}`;
+      return !finalCommentsSet.has(key);
+    });
+
+    const finalCommentsWithPrivate = [...finalComments, ...missingPrivateComments];
     await saveCommentsToVCM(relativePath, finalCommentsWithPrivate);
   }
 
@@ -1960,7 +2021,7 @@ async function activate(context) {
             }
           }
 
-          // Only add the specific comment being marked as private
+          // Only add this one comment to VCM, marked as private
           targetComment.isPrivate = true;
           comments = [targetComment];
         } else {
@@ -2123,33 +2184,75 @@ async function activate(context) {
           anchorHash = hashLine(lines[anchorLineIndex], 0);
         }
 
-        // Search for comment with this anchor and remove isPrivate
-        let found = false;
-        for (const c of comments) {
-          if (c.anchor === anchorHash && c.isPrivate) {
-            delete c.isPrivate;
-            found = true;
-          }
+        // Extract current comments to match by context
+        const currentComments = extractComments(doc.getText(), doc.uri.path);
+        const currentCandidates = currentComments.filter(c => c.anchor === anchorHash);
+
+        if (currentCandidates.length === 0) {
+          vscode.window.showWarningMessage("VCM: Could not find a matching comment entry in current file.");
+          return;
         }
 
-        if (!found) {
+        // Find the current comment at the selected line
+        let currentComment = currentCandidates.find(c => c.originalLine === selectedLine);
+        if (!currentComment && currentCandidates.length > 0) {
+          currentComment = currentCandidates[0]; // Fallback
+        }
+
+        // Match to VCM comment using context
+        const vcmCandidates = comments.filter(c => c.anchor === anchorHash && c.isPrivate);
+
+        if (vcmCandidates.length === 0) {
           vscode.window.showWarningMessage("VCM: This comment is not marked as private.");
           return;
         }
 
+        let targetVcmComment;
+        if (vcmCandidates.length === 1) {
+          targetVcmComment = vcmCandidates[0];
+        } else {
+          // Use context hashes to find best match
+          let bestMatch = null;
+          let bestScore = -1;
+
+          for (const vcm of vcmCandidates) {
+            let score = 0;
+            if (currentComment.prevHash && vcm.prevHash === currentComment.prevHash) {
+              score += 10;
+            }
+            if (currentComment.nextHash && vcm.nextHash === currentComment.nextHash) {
+              score += 10;
+            }
+            if (score > bestScore) {
+              bestScore = score;
+              bestMatch = vcm;
+            }
+          }
+          targetVcmComment = bestMatch || vcmCandidates[0];
+        }
+
+        // Remove isPrivate flag
+        delete targetVcmComment.isPrivate;
+
         // Save updated comments (will split into shared/private automatically)
         await saveCommentsToVCM(relativePath, comments);
 
-        // Check if private comments are currently visible - if so, remove this comment
+        // Check if we're in clean mode OR if private comments are hidden
+        // In these cases, the comment is not currently visible in the document
+        const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
         const privateVisible = privateCommentsVisible.get(doc.uri.fsPath) !== false;
 
-        if (privateVisible) {
-          // Remove the comment from the document
+        // Only remove from document if in clean mode (comments not visible)
+        if (!isInCommentedMode) {
+          // We're in clean mode - the private comment was not visible anyway
+          // No need to remove anything from the document
+        } else if (!privateVisible) {
+          // We're in commented mode but private comments are hidden
+          // Remove the comment from the document since it was only visible because it was private
           const edit = new vscode.WorkspaceEdit();
 
-          // For block comments, we need to find all lines in the block
-          const currentComments = extractComments(doc.getText(), doc.uri.path);
-          const matchingComment = currentComments.find(c => c.anchor === anchorHash);
+          // Use the currentComment we already found
+          const matchingComment = currentComment;
 
           if (matchingComment) {
             if (matchingComment.type === "block" && matchingComment.block) {
@@ -2188,6 +2291,7 @@ async function activate(context) {
             await doc.save();
           }
         }
+        // If in commented mode with private visible, comment stays in document (moved to shared)
 
         vscode.window.showInformationMessage("VCM: Unmarked Private ✅");
         // Update context to refresh menu items
@@ -2294,6 +2398,10 @@ async function activate(context) {
           newText = injectComments(text, commentsToInject);
 
           privateCommentsVisible.set(doc.uri.fsPath, true);
+
+          // Mark that we just injected from VCM so saveVCM doesn't re-extract these as shared comments
+          justInjectedFromVCM.add(doc.uri.fsPath);
+
           vscode.window.showInformationMessage("VCM: Private comments visible 🔓");
         }
 
