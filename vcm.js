@@ -163,27 +163,47 @@ const COMMENT_MARKERS = {
 // Get comment markers for a specific file based on extension
 // Returns array of comment marker strings for the file type
 function getCommentMarkersForFile(filePath) {
+  // split the string by the period ex) vcm.js -> ['vcm','js']
+  // pop the last el of the array -> ['js']
+  // ensure consistency by making it lowercase if it isnt
   const ext = filePath.split('.').pop().toLowerCase();
-  return COMMENT_MARKERS[ext] || ['#', '//', '--', '%', ';']; // Default: support all common markers
+  // retrieve all markers for the matching index comment_markers['.js'] or default to common markers if undefined (if we dont have that filetype listed)
+  return COMMENT_MARKERS[ext] || ['#', '//', '--', '%', ';']; 
 }
 
-// Content provider for the custom "vcm-view:" URI scheme
-// This allows us to display virtual documents in VS Code without creating real files
+// Content Provider (provides the files text content) for generating and dynamically updating the split view VCM_filename.type. like a server
+// This allows us to display *virtual* documents in VS Code (temp/non stored files)
 class VCMContentProvider {
+  // function for a class specifically used to initialize the properties of an object
   constructor() {
-    this.content = new Map(); // Map of URI -> document content
+    // this.content is creating a custom property which creates a Map of URI (temp VCM_) -> document content, which is..
+    // Key → the document’s unique URI (e.g., vcm-view:/some/file)
+    // Value → the actual string content of that “document.”
+    // It’s an in-memory store for what each virtual document currently displays.
+    // When placing Map in constructor(), it’s like saying:
+    // “Each time I make a new VCMContentProvider (view), give it a clean whiteboard.”
+    this.content = new Map(); 
+    // Creates a new event emitter from the VS Code API.
+    // This object can “fire” events that tell VS Code something changed.
+    // Think of it as a signal: “Hey editor, refresh this content.”
     this._onDidChange = new vscode.EventEmitter();
+    // Exposes a read-only event property so VS Code (VCM_) can subscribe to changes.
+    // When fire() is called later, anything listening to onDidChange reacts — usually VS Code re-requests the document’s content.
     this.onDidChange = this._onDidChange.event;
   }
 
-  // Called by VS Code when it needs to display a vcm-view: document
+  // response handler method called by VS Code when it needs to display text to a vcm-view (uri): document
   provideTextDocumentContent(uri) {
+    // In the Map, look up the uri and return the content string else empty string
     return this.content.get(uri.toString()) || "";
   }
 
-  // Update the content for a specific URI and notify VS Code
+  // server push that forces update of vcm-view's (uri's) content
   update(uri, content) {
+    // update the vcm_ (content's Map) for the specific file view (uri) with the new content
     this.content.set(uri.toString(), content);
+    // immediately fire the event telling VS Code the document changed.
+    // VS Code hears the event → re-calls provideTextDocumentContent() → updates the editor display.
     this._onDidChange.fire(uri);
   }
 }
@@ -194,9 +214,10 @@ class VCMContentProvider {
 // Example: "x = 5" -> "a3f2b1c4"
 function hashLine(line, lineIndex) {
   return crypto.createHash("md5")
-    .update(line.trim())  // Only hash content, NOT line index
-    .digest("hex")
-    .substring(0, 8);
+  .update(line.trim())  // Hash content and removes spaces at both ends so formatting changes don’t alter the hash.
+  .digest("hex") // Finalizes the hash and converts it to a hexadecimal string.
+  .substring(0, 8); // Takes only the first 8 characters of the hash (a shorter ID).
+  // Ex: "x = 5" -> "a3f2b1c4"
 }
 
 // Merge new comments with existing VCM comments using hash matching
@@ -286,62 +307,91 @@ function mergeCommentsWithVCM(newComments, existingComments) {
 
 // Detect initial state: are comments visible or hidden?
 // Returns: true if comments are visible (isCommented), false if in clean mode
-async function detectInitialMode(doc, vcmFileUri, vcmDir) {
+async function detectInitialMode(doc, vcmDir) {
+  // get file path relative to workspace root
   const relativePath = vscode.workspace.asRelativePath(doc.uri);
+  // build path to matching .vcm.json
   const vcmPath = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
-  try {
-    // VCM exists - check if first 5-10 NON-alwaysShow comments from VCM match the file
+  try { // Try to load the VCM metadata file
+    // .readFile(vcmPath) reads the raw file bytes from current folder.
+    // await pauses execution until that read finishes.
+    // .toString() converts that byte array into an actual text string:
+    // JSON.parse(...) converts JSON string into an object you can manipulate.
+    // It’s converting bytes → string → object.
     const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmPath)).toString());
+    // Access the property comments from the JSON data or empty arr if none which prevents runtime errors like “Cannot read property 'filter' of undefined”.
     const comments = vcmData.comments || [];
+    // If this succeeds, we know we’ve previously saved comment data for this file.
 
-    // Filter out alwaysShow comments for detection (they're always visible)
+    // filter through that files comments and keep only those where alwaysShow property is false or undefined.
+    // This separates the comments that are optional (toggleable) from ones that are permanently displayed.
     const nonAlwaysShowComments = comments.filter(c => !c.alwaysShow);
 
+    // If *Only* alwaysShow comments exist
     if (nonAlwaysShowComments.length === 0) {
-      // Only alwaysShow comments exist - need to check if there are other comments in file
-      // If the file has MORE comments than just alwaysShow, we're in commented mode
+      // doc.getText() returns the entire visible file contents (the actual open document in VS Code).
+      // .split('\n') turns it into an array where each element is the line numbers text content. 
       const lines = doc.getText().split('\n');
+      // call the helper that determines the file type's comment marker (returns array)
       const commentMarkers = getCommentMarkersForFile(doc.uri.path);
+      // Counter to track how many comment lines exist in the actual file text.
       let commentCount = 0;
+      // scan each line
       for (const line of lines) {
+        // .trim() removes spaces from both ends
         const trimmed = line.trim();
+        // blank lines are skipped (continue).
         if (!trimmed) continue;
+        // for each possible comment marker:
         for (const marker of commentMarkers) {
+          // Check if the line starts with that marker (// comment, # note, etc.).
           if (trimmed.startsWith(marker)) {
+            // If it does, increment commentCount
             commentCount++;
+            // skip redundant marker checks for that same line because this counts the number of visible comments currently in the file.
             break;
           }
         }
       }
-      // If we have more comments in file than alwaysShow comments in VCM, we're in commented mode
+      // comments.length = total comments recorded in the .vcm.json file (including alwaysShow).
+      // If the actual file currently has more comment lines than what the metadata says, that means comments are presently visible in the source.
+      // Returns true → “commented mode.” or false → "clean mode"
       return commentCount > comments.length;
     }
 
     const lines = doc.getText().split('\n');
     const checkCount = Math.min(10, nonAlwaysShowComments.length);
-
-    // Check if first N NON-alwaysShow comments exist in the file
+    
+    // Loop first 10 NON-alwaysShow comments exist in the file
     for (let i = 0; i < checkCount; i++) {
+      // each singular comment
       const comment = nonAlwaysShowComments[i];
+      // where the comment used to be (saved in metadata when comments were last toggled).
       const lineIndex = comment.originalLine;
 
+      // If that comment index is beyond the end of the current file, skip.
       if (lineIndex >= lines.length) continue;
 
+      // text currently at this position
       const currentLine = lines[lineIndex];
+      // if its an inline comment
       const commentText = comment.type === 'inline'
-        ? comment.text
+        ? comment.text // use comment.text
+        // else if its a block comment and has a first index,
+        // then commentText is the block text else empty string
         : (comment.block && comment.block[0] ? comment.block[0].text : '');
-
+      
+      // if commentText exists and the current line doesnt include it
       if (commentText && !currentLine.includes(commentText)) {
         return false; // Comment not found - we're in clean mode
       }
     }
 
-    return true; // All checked comments found - we're in commented mode
+    return true; // All 10 sample comments were present, so the file is in commented mode.
 
-  } catch {
-    // No VCM exists - check if the actual file has comments
+  } catch { // If the .vcm.json didn’t exist or was unreadable:
+    // Check if the actual file has comments
     const commentMarkers = getCommentMarkersForFile(doc.uri.path);
     const lines = doc.getText().split('\n');
 
@@ -350,6 +400,7 @@ async function detectInitialMode(doc, vcmFileUri, vcmDir) {
       if (!trimmed) continue;
 
       for (const marker of commentMarkers) {
+        // If any line begins with a comment marker, return true (commented).
         if (trimmed.startsWith(marker)) {
           return true; // File has comments - isCommented = true
         }
@@ -361,48 +412,44 @@ async function detectInitialMode(doc, vcmFileUri, vcmDir) {
 }
 
 // -----------------------------------------------------------------------------
-// Comment Extraction + Injection
+// Comment Extraction 
 // -----------------------------------------------------------------------------
-
-// Parse source code and extract all comments with their anchor points
-// Returns an array of comment objects that can be saved to .vcm files
-// 
-// Comment types:
-// - "block": Multi-line comments above code (e.g., docstrings, headers)
-// - "inline": Comments on the same line as code (e.g., x = 5  # counter)
-//
-// Key concept: Comments are "anchored" to the next line of code below them
-// This allows reconstruction even if line numbers change
-// Context hashes (prevHash, nextHash) help disambiguate identical anchor lines
+// text: the entire file content (string), filePath: the full path
 function extractComments(text, filePath) {
-  const lines = text.split("\n");
+  const lines = text.split("\n"); // Splits file text into an array of individual lines.
   const comments = [];      // Final array of all extracted comments
-  let commentBuffer = [];   // Temporary buffer for consecutive comment lines
+  let commentBuffer = [];   // Temporary holding area for consecutive comment lines
 
-  // Get comment markers for this file type from our centralized config
+  // Get comment markers for this file type from our centralized config list
   const commentMarkers = getCommentMarkersForFile(filePath);
 
   // Build regex pattern for this file type
+  // .replace() escapes special regex characters like *, ?, (, ), etc., because // or % would otherwise break the regex engine.
+  // .join('|') means “match any of these markers.”
+  // Example:
+  // If commentMarkers = ["//", "#"],
+  // then markerPattern = "\\/\\/|#" — usable inside new RegExp().
   const markerPattern = commentMarkers.map(m => m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   
-  // Helper: Check if a line is a comment
+  // Helper: Check if a line is a comment or code
   const isComment = (l) => {
-    const trimmed = l.trim();
-    for (const marker of commentMarkers) {
+    const trimmed = l.trim(); // Remove whitespace
+    for (const marker of commentMarkers) { // loop over all possible markers for this file
+      // Check whether the line begins with any marker and return true if so
       if (trimmed.startsWith(marker)) return true;
     }
-    return false;
+    return false; // not a comment line
   };
 
   // Helper: Find the next non-blank code line after index i
   const findNextCodeLine = (startIndex) => {
-    for (let j = startIndex + 1; j < lines.length; j++) {
+    for (let j = startIndex + 1; j < lines.length; j++) { // Loops forward from the given index.
       const trimmed = lines[j].trim();
-      if (trimmed && !isComment(lines[j])) {
-        return j;
+      if (trimmed && !isComment(lines[j])) { // Skip blank lines and comments.
+        return j; // return code lines index
       }
     }
-    return -1;
+    return -1; // if none found, return to last line of code's index we found.
   };
 
   // Helper: Find the previous non-blank code line before index i
@@ -410,10 +457,10 @@ function extractComments(text, filePath) {
     for (let j = startIndex - 1; j >= 0; j--) {
       const trimmed = lines[j].trim();
       if (trimmed && !isComment(lines[j])) {
-        return j;
+        return j; // index of next line of code
       }
     }
-    return -1;
+    return -1; // no code line was found after this point (end of file). So that nextHash becomes null instead of blowing up
   };
 
   // Process each line sequentially
@@ -428,15 +475,15 @@ function extractComments(text, filePath) {
         text: line,           // Full line exactly as it appears
         originalLine: i,      // 0-based line index
       });
-      continue; // Move to next line, stay in comment-gathering mode
+      continue; // Don’t finalize it yet. move to next line. You might be in the middle of a comment block.
     }
 
-    // CASE 1.5: Blank line - check if it's within a comment block
-    if (!trimmed) {
-      // If we have comments buffered, check if the next non-blank line is also a comment
+    // CASE 1.5: Currently on Blank line - check if it's within a comment block
+    if (!trimmed) { // if no (trimmed) lines
+      // If we have comments buffered (grouped), check if the next non-blank line is also a comment
       if (commentBuffer.length > 0) {
+        let nextNonBlankIdx = -1; // initializes a “not-found” value.
         // Look ahead to find the next non-blank line
-        let nextNonBlankIdx = -1;
         for (let j = i + 1; j < lines.length; j++) {
           if (lines[j].trim()) {
             nextNonBlankIdx = j;
@@ -458,16 +505,16 @@ function extractComments(text, filePath) {
     }
 
     // CASE 2: This line is code - check for inline comment(s)
-    // Find the first comment marker and extract everything after it as ONE combined comment
+    // Find the first comment marker preceded by white space and extract everything after it as ONE combined comment
+    // (\\s+) → one or more whitespace characters
     let inlineRegex = new RegExp(`(\\s+)(${markerPattern})`, "");
     let match = line.match(inlineRegex);
 
     if (match) {
-      // Extract everything from the first comment marker onwards (all inline comments combined)
-      const commentStartIndex = match.index;
-      const fullComment = line.substring(commentStartIndex);
+      const commentStartIndex = match.index; // tells where the comment begins.
+      const fullComment = line.substring(commentStartIndex); // extract from that point to the end → the whole inline comment.
 
-      // Context lines
+      // Context line hashes that are before and after
       const prevIdx = findPrevCodeLine(i);
       const nextIdx = findNextCodeLine(i);
 
@@ -476,20 +523,20 @@ function extractComments(text, filePath) {
 
       comments.push({
         type: "inline",
-        anchor: hashLine(anchorBase, 0),
+        anchor: hashLine(anchorBase, 0), // hash of the line’s code (for identification later),
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
-        originalLine: i,
+        originalLine: i, // the line number it appeared on (changes per mode so not reliable alone)
         text: fullComment,  // Store ALL inline comments as one combined text
       });
     }
 
-    // CASE 3: We have buffered comment lines above this code line
+    // CASE 3: We have buffered comment lines (comment group) above this code line
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
       // Count blank lines BEFORE the first comment line
       const firstCommentLine = commentBuffer[0].originalLine;
-      let leadingBlankLines = 0;
+      let leadingBlankLines = 0; // keep count
       for (let j = firstCommentLine - 1; j >= 0; j--) {
         if (!lines[j].trim()) {
           leadingBlankLines++;
@@ -502,7 +549,7 @@ function extractComments(text, filePath) {
       const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLine;
       const trailingBlankLines = i - lastCommentLine - 1;
 
-      // Store context: previous code line and next code line
+      // Store context again: previous code line and next code line
       const prevIdx = findPrevCodeLine(i);
       const nextIdx = findNextCodeLine(i);
 
@@ -511,7 +558,7 @@ function extractComments(text, filePath) {
         anchor: hashLine(line, 0), // Just content hash
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
-        insertAbove: true,
+        insertAbove: true, // when re-adding comments, they should appear above that line.
         block: commentBuffer,
         leadingBlankLines: leadingBlankLines > 0 ? leadingBlankLines : undefined,
         trailingBlankLines: trailingBlankLines > 0 ? trailingBlankLines : undefined,
@@ -544,57 +591,73 @@ function extractComments(text, filePath) {
   return comments;
 }
 
+// -----------------------------------------------------------------------------
+// Comment Injection
+// -----------------------------------------------------------------------------
 // Reconstruct source code by injecting comments back into clean code
-// Takes:
-//   cleanText - Code with alwaysShow comments already present, other comments removed
-//   comments - Array of comment objects from extractComments()
-//   includePrivate - Whether to include private comments (default: false)
-// Returns: Full source code with comments restored
+// cleanText → the code in clean mode (with comments stripped out).
+// comments → parsed metadata previously extracted from the commented version (what you want to re-inject).
+// includePrivate → flag to decide whether to re-insert private comments.. Default to privatemode off unless specified to avoid undefined
 function injectComments(cleanText, comments, includePrivate = false) {
+  // split("\n") turns the code into an array of lines so you can loop by index.
   const lines = cleanText.split("\n");
-  const result = [];  // Will contain the final reconstructed code
+  const result = [];  // Where you’ll push lines and comments in order, then join back later.
 
-  // Filter out alwaysShow comments (managed separately)
-  // Include/exclude private comments based on includePrivate parameter
+  // Include/exclude private comments based on if includePrivate is toggled on or off
   const commentsToInject = comments.filter(c => {
-    if (c.alwaysShow) return false; // Always exclude alwaysShow
-    if (c.isPrivate && !includePrivate) return false; // Exclude private if not included
+    if (c.alwaysShow) return false; // Always exclude alwaysShow (managed separately)
+    if (c.isPrivate && !includePrivate) return false; // Exclude private if not explicitly included
     return true;
   });
 
-  // Build a map of line content hash -> array of line indices (handles duplicates)
+  // Create an empty Map to link each line’s unique hash → all positions in the file where that line exists. 
+  // (handles duplicates)
+  // You use a Map instead of an object because the keys (hash strings) are not simple variable names and you may have duplicates.
   const lineHashToIndices = new Map();
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim()) {
-      const hash = hashLine(lines[i], 0); // Content-only hash
-      if (!lineHashToIndices.has(hash)) {
-        lineHashToIndices.set(hash, []);
+  for (let i = 0; i < lines.length; i++) { // Iterates through every line.
+    // Remove whitespace per line and if the result is empty (meaning blank line), it skips it. You don’t hash blank lines because they’re not meaningful anchors for comments.
+    if (lines[i].trim()) { 
+      // Hash each unique content line
+      // Takes the current line’s code content (not line number) and generates a deterministic hash.
+      // Hashes let you re-anchor comments even if the code is moved up or down because you can later match by the same hash.
+      const hash = hashLine(lines[i], 0); 
+      if (!lineHashToIndices.has(hash)) { // If this hash hasn’t been seen before
+        lineHashToIndices.set(hash, []); // Create a new list as its value in the map.
       }
+      // Add the current line’s index to that hash’s list
+      // This allows for duplicate code lines:
+      // If the same text appears twice (say, import torch on lines 3 and 20),
+      // the map will have: "hash(import torch)" → [3, 20]
+      // So later you can decide which one the comment should attach to.
       lineHashToIndices.get(hash).push(i);
     }
   }
 
-  // Helper: Find best matching line index using context hashes
+  // Helper: Find best matching line index among duplicates using context hashes
+  // When several lines share the same content hash, this function decides which one should anchor the comment.
   const findBestMatch = (comment, candidateIndices, usedIndices) => {
-    if (candidateIndices.length === 1) {
-      return candidateIndices[0];
+    if (candidateIndices.length === 1) { // Shortcut: if only one match: done.
+      return candidateIndices[0]; // return that one match
     }
 
-    // Filter out already used indices
+    // When multiple identical code lines exist (same hash), candidateIndices might have several matches.
+    // usedIndices tracks lines already assigned to other comments.
+    // → You filter them out so you don’t attach multiple comment blocks to the same line.
     const available = candidateIndices.filter(idx => !usedIndices.has(idx));
     if (available.length === 0) {
       // All used, fall back to any candidate
       return candidateIndices[0];
     }
-    if (available.length === 1) {
-      return available[0];
+
+    if (available.length === 1) { // if only one available
+      return available[0]; // return that one. No need to score.
     }
 
-    // Check context hashes to find the best match
+    // Build a list of possible line indices, each with a “score” indicating how well its context fits.
     const scores = available.map(idx => {
       let score = 0;
 
-      // Find previous non-blank code line
+      // Find previous non-blank nearest neighbor code line
       let prevIdx = -1;
       for (let j = idx - 1; j >= 0; j--) {
         if (lines[j].trim()) {
@@ -603,7 +666,7 @@ function injectComments(cleanText, comments, includePrivate = false) {
         }
       }
 
-      // Find next non-blank code line
+      // Find next non-blank nearest neighbor code line
       let nextIdx = -1;
       for (let j = idx + 1; j < lines.length; j++) {
         if (lines[j].trim()) {
@@ -612,7 +675,9 @@ function injectComments(cleanText, comments, includePrivate = false) {
         }
       }
 
-      // Score based on matching context
+      // Compare these neighbor lines to the comment’s stored hashes and score based on matching context
+      // Add 10 points for each matching context hash.
+      // Higher score = better contextual fit.
       if (comment.prevHash && prevIdx >= 0) {
         const prevHash = hashLine(lines[prevIdx], 0);
         if (prevHash === comment.prevHash) score += 10;
@@ -628,18 +693,22 @@ function injectComments(cleanText, comments, includePrivate = false) {
 
     // Sort by score (highest first), then by index (to maintain order)
     scores.sort((a, b) => {
+      // Sort by score descending
       if (b.score !== a.score) return b.score - a.score;
-      return a.idx - b.idx;
+      return a.idx - b.idx; // sort and return index by index ascending.
     });
 
-    return scores[0].idx;
+    return scores[0].idx; // Return the index with highest contextual match.
   };
 
-  // Separate comments by type and sort by originalLine
+  // Separate block comments by type and sort by originalLine
+  // Ensure that when you loop through comments, they’re in natural file order, not random JSON order.
+  // .sort(...) orders the comment blocks from top to bottom according to where they originally appeared in the file.
+  // That way, when you inject them, they’re added in the same vertical order they were extracted.
   const blockComments = commentsToInject.filter(c => c.type === "block").sort((a, b) => {
     const aLine = a.block[0]?.originalLine || 0;
     const bLine = b.block[0]?.originalLine || 0;
-    return aLine - bLine;
+    return aLine - bLine; // sort them ascending (top of file first).
   });
   const inlineComments = commentsToInject.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
 
@@ -648,11 +717,12 @@ function injectComments(cleanText, comments, includePrivate = false) {
 
   // Build maps: line index -> comment
   const blockMap = new Map();
+  
   for (const block of blockComments) {
     const indices = lineHashToIndices.get(block.anchor);
     if (indices && indices.length > 0) {
       const targetIndex = findBestMatch(block, indices, usedIndices);
-      usedIndices.add(targetIndex);
+      usedIndices.add(targetIndex); // Adds the target index to usedIndices so you don’t double-assign it.
 
       if (!blockMap.has(targetIndex)) {
         blockMap.set(targetIndex, []);
@@ -675,6 +745,8 @@ function injectComments(cleanText, comments, includePrivate = false) {
   }
 
   // First pass: identify which blank lines belong to comment spacing
+  // You’ll later use this to skip printing blank lines twice.
+  // If a blank belongs to a comment, you mark its index here and don’t push it again later in the rebuild loop.
   const blankLinesOwnedByComments = new Set();
 
   for (let i = 0; i < lines.length; i++) {
@@ -704,11 +776,14 @@ function injectComments(cleanText, comments, includePrivate = false) {
     }
   }
 
-  // Second pass: rebuild the file
+  // Second pass: rebuild the file line by line
+  // Iterate through every line of clean code
+  // i represents both position in original clean code and potential anchor target for comments.
   for (let i = 0; i < lines.length; i++) {
     // STEP 1: Insert any block comments anchored to this line
-    // These go ABOVE the code line
+    // blocks maps anchor index → block comment(s) that should appear above this code line.
     const blocks = blockMap.get(i);
+    // Handle the case of multiple comment blocks anchored to the same code line (stacked).
     if (blocks) {
       for (const block of blocks) {
         const leadingBlanks = block.leadingBlankLines || 0;
@@ -716,16 +791,25 @@ function injectComments(cleanText, comments, includePrivate = false) {
 
         // Collect all consecutive blank lines before the anchor
         const allBlankLines = [];
-        for (let j = i - 1; j >= 0; j--) {
-          if (!lines[j].trim()) {
-            allBlankLines.unshift(lines[j]); // Add to front to maintain order
+        // i is the current anchor line index (code line we’re attaching comments to)
+        // We start scanning upward (j--) from that line.
+        for (let j = i - 1; j >= 0; j--) { 
+          if (!lines[j].trim()) { // if after removing whitespace theres no code, its a blank line
+            // unshift to iterate upward and add to front of array
+            // index 5 → code line
+            // index 4 → ""
+            // index 3 → ""
+            // index 2 → code
+            allBlankLines.unshift(lines[j]); 
           } else {
-            break;
+            break; // stops scanning once you hit non-blank code above.
           }
         }
 
         // Split them: first N are leading, next M are trailing
-        const leadingBlankLines = allBlankLines.slice(0, leadingBlanks);
+        // number of blank lines that belong to the comment (above the comment block).
+        const leadingBlankLines = allBlankLines.slice(0, leadingBlanks); 
+        // blank lines between comment and code anchor.
         const trailingBlankLines = allBlankLines.slice(leadingBlanks, leadingBlanks + trailingBlanks);
 
         // Add leading blanks
