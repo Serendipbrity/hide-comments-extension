@@ -20,6 +20,11 @@ let vcmSyncEnabled = true; // Flag to temporarily disable .vcm file updates duri
 // Map is a Class for storing key value pairs. 
 // new Map creates an empty instance to use crud on
 // maps are better than objects because the key doesnt have to be a string and it keeps the key value ordering that they were added in. 
+// What 'new' does under the hood:
+// 1 Creates a fresh empty object: {}
+// 2 Links that object’s internal prototype to the constructor’s .prototype.
+// 3 Runs the constructor function, binding this to that new object.
+// 4 Returns the new object automatically.
 let isCommentedMap = new Map(); // Track state: true = comments visible, false = clean mode (comments hidden)
 let justInjectedFromVCM = new Set(); // Track files that just had VCM comments injected (don't re-extract)
 let privateCommentsVisible = new Map(); // Track private comment visibility per file: true = visible, false = hidden
@@ -30,29 +35,129 @@ let privateCommentsVisible = new Map(); // Track private comment visibility per 
 
 // Comment markers per file type - single source of truth for all languages
 const COMMENT_MARKERS = {
+  // Python-family
   'py': ['#'],
   'python': ['#'],
   'pyx': ['#'],
   'pyi': ['#'],
+
+  // JavaScript / TypeScript
   'js': ['//'],
   'jsx': ['//'],
   'ts': ['//'],
   'tsx': ['//'],
-  'java': ['//'],
+
+  // C-family
   'c': ['//'],
-  'cpp': ['//'],
   'h': ['//'],
+  'cpp': ['//'],
+  'cc': ['//'],
+  'cxx': ['//'],
   'hpp': ['//'],
-  'cs': ['//'],
-  'go': ['//'],
-  'rs': ['//'],
+  'hh': ['//'],
+  'ino': ['//'],     // Arduino
+  'cs': ['//'],      // C#
+  'java': ['//'],
   'swift': ['//'],
+  'go': ['//'],
+  'rs': ['//'],      // Rust
+  'kt': ['//'],      // Kotlin
+  'kts': ['//'],     // Kotlin scripts
+
+  // Web / Frontend
+  'css': ['/*'],     // note: block style
+  'scss': ['//', '/*'],
+  'less': ['//', '/*'],
+  'html': ['<!--'],
+  'htm': ['<!--'],
+  'xml': ['<!--'],
+  'vue': ['//', '<!--'],
+  'svelte': ['//', '<!--'],
+
+  // SQL / DB
   'sql': ['--'],
+  'psql': ['--'],
+  'plsql': ['--'],
+  'mysql': ['--', '#'],
+
+  // Lua / Haskell
   'lua': ['--'],
+  'hs': ['--'],
+  'lhs': ['--'],
+
+  // Shell / Scripting
+  'sh': ['#'],
+  'bash': ['#'],
+  'zsh': ['#'],
+  'ksh': ['#'],
+  'fish': ['#'],
+  'r': ['#'],
+  'rscript': ['#'],
+  'pl': ['#'],      // Perl
+  'pm': ['#'],      // Perl module
+  'rb': ['#'],      // Ruby
+  'cr': ['#'],      // Crystal
+  'awk': ['#'],
+  'tcl': ['#'],
+
+  // PHP / Hack
+  'php': ['//', '#'],
+
+  // MATLAB / Octave
   'm': ['%'],
   'matlab': ['%'],
+  'octave': ['%'],
+
+  // Assembly / Low-level
   'asm': [';'],
-  's': [';']
+  's': [';'],
+  'S': [';'],
+  'nas': [';'],
+
+  // Lisp / Scheme / Clojure
+  'lisp': [';'],
+  'cl': [';'],
+  'el': [';'],
+  'scm': [';'],
+  'ss': [';'],
+  'clj': [';'],
+  'cljs': [';'],
+  'cljc': [';'],
+
+  // Pascal / Delphi
+  'pas': ['//'],   // also supports { } and (* *)
+  'dpr': ['//'],
+
+  // Fortran
+  'f': ['!'],
+  'f90': ['!'],
+  'f95': ['!'],
+
+  // TeX / LaTeX
+  'tex': ['%'],
+  'latex': ['%'],
+
+  // VB / Basic
+  'vb': ["'"],
+  'vbs': ["'"],
+  'bas': ["'"],
+  'frm': ["'"],
+
+  // PowerShell
+  'ps1': ['#'],
+  'psm1': ['#'],
+
+  // Config / Data
+  'ini': [';', '#'],
+  'toml': ['#'],
+  'yaml': ['#'],
+  'yml': ['#'],
+  'env': ['#'],
+
+  // Markdown / Docs
+  'md': ['<!--'],
+  'markdown': ['<!--'],
+  'rst': ['..'], // reStructuredText
 };
 
 // Get comment markers for a specific file based on extension
