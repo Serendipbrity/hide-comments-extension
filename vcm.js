@@ -830,10 +830,28 @@ function injectComments(cleanText, comments, includePrivate = false) {
           allBlockLines.push(...block.block);
         }
 
-        for (const c of allBlockLines) {
-          // Just push the full text as-is (includes indent, marker, spacing, text)
-          result.push(c.text);
-        }
+        // If we have text_cleanMode, it already includes blank lines in the block array
+        // Don't add calculated leading/trailing blanks or we'll get duplicates
+        if (block.text_cleanMode && Array.isArray(block.text_cleanMode)) {
+          // Just push the merged block lines (blank lines already included)
+          for (const c of allBlockLines) {
+            result.push(c.text);
+          }
+        } else {
+          // No text_cleanMode - use the old logic with calculated leading/trailing blanks
+          // Split them: first N are leading, next M are trailing
+          const leadingBlankLines = allBlankLines.slice(0, leadingBlanks);
+          const trailingBlankLines = allBlankLines.slice(leadingBlanks, leadingBlanks + trailingBlanks);
+
+          // Add leading blanks
+          for (const blank of leadingBlankLines) {
+            result.push(blank);
+          }
+
+          // Add block lines
+          for (const c of allBlockLines) {
+            result.push(c.text);
+          }
 
         // Add trailing blanks
         for (const blank of trailingBlankLines) {
