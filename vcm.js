@@ -1192,7 +1192,7 @@ async function activate(context) {
 
     // If state is not set, initialize it by detecting the mode
     if (isCommented === undefined) {
-      isCommented = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      isCommented = await detectInitialMode(doc, vcmDir);
       isCommentedMap.set(doc.uri.fsPath, isCommented);
     }
 
@@ -1495,15 +1495,26 @@ async function activate(context) {
           showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
         } else {
           // Source is in clean mode, show commented in split view
-          // First strip any comments typed in clean mode, then inject VCM comments
+          // Only show comments that have been fully merged (not just text_cleanMode)
           const { allComments: comments } = await loadAllComments(relativePath);
           const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
 
-          // Strip comments from clean text first (to remove comments typed in clean mode)
-          const cleanText = stripComments(text, doc.uri.path, comments, false);
+          // Filter out comments that only have text_cleanMode (not yet merged into main text)
+          // These are newly typed comments that will be merged when toggling to commented mode
+          const mergedComments = comments.filter(c => {
+            if (c.type === "inline") {
+              return c.text != null; // Only include if text is set (not just text_cleanMode)
+            } else if (c.type === "block") {
+              return c.block != null; // Only include if block is set (not just text_cleanMode)
+            }
+            return true;
+          });
 
-          // Then inject VCM comments
-          showVersion = injectComments(cleanText, comments, includePrivate);
+          // Strip comments from clean text first (to remove comments typed in clean mode)
+          const cleanText = stripComments(text, doc.uri.path, mergedComments, false);
+
+          // Then inject only fully merged VCM comments
+          showVersion = injectComments(cleanText, mergedComments, includePrivate);
         }
 
         // Update the split view content
@@ -1551,7 +1562,7 @@ async function activate(context) {
 
     // Detect initial state if not already set
     if (!isCommentedMap.has(doc.uri.fsPath)) {
-      const initialState = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      const initialState = await detectInitialMode(doc, vcmDir);
       isCommentedMap.set(doc.uri.fsPath, initialState);
     }
 
@@ -2662,7 +2673,7 @@ async function activate(context) {
 
     // Detect initial state if not already set
     if (!isCommentedMap.has(doc.uri.fsPath)) {
-      const initialState = await detectInitialMode(doc, vcmFileUri, vcmDir);
+      const initialState = await detectInitialMode(doc, vcmDir);
       isCommentedMap.set(doc.uri.fsPath, initialState);
     }
 
@@ -2692,6 +2703,12 @@ async function activate(context) {
 
     // Track which source document has the split view open for live sync
     sourceDocUri = doc.uri;
+
+    // Dispose of any existing scroll listener before creating a new one
+    if (scrollListener) {
+      scrollListener.dispose();
+      scrollListener = null;
+    }
 
     // Setup bidirectional click-to-jump (source → split view)
     const sourceEditor = editor;
