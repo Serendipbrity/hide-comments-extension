@@ -7,8 +7,8 @@
 // 3. Persistent storage: Comments saved to .vcm directory for reconstruction
 // ==============================================================================
 
-const vscode = require("vscode");
-const crypto = require("crypto");
+const vscode = require("vscode"); // vs code api module. lets us talk to and control VSCode itself
+const crypto = require("crypto"); // for generating hashes
 
 // Global state variables for the extension
 let vcmStatus;           // Status bar item showing VCM state
@@ -17,6 +17,9 @@ let tempUri;             // URI for the temporary VCM view document
 let scrollListener;      // Event listener for cursor movement between panes
 let sourceDocUri;        // Track which source document has the split view open
 let vcmSyncEnabled = true; // Flag to temporarily disable .vcm file updates during toggles
+// Map is a Class for storing key value pairs. 
+// new Map creates an empty instance to use crud on
+// maps are better than objects because the key doesnt have to be a string and it keeps the key value ordering that they were added in. 
 let isCommentedMap = new Map(); // Track state: true = comments visible, false = clean mode (comments hidden)
 let justInjectedFromVCM = new Set(); // Track files that just had VCM comments injected (don't re-extract)
 let privateCommentsVisible = new Map(); // Track private comment visibility per file: true = visible, false = hidden
@@ -2108,12 +2111,20 @@ async function activate(context) {
           commentAtCursor.isPrivate = true;
           comments = [commentAtCursor];
         } else {
-          // VCM exists - find and mark the matching comment using ALL hashes
+          // VCM exists - find and mark the matching comment using ALL hashes + text
           comments = allComments;
 
+          // For inline comments, also match on text to distinguish between multiple inline comments with same hashes
           const targetVcmComment = comments.find(vcm => {
             const vcmKey = `${vcm.type}:${vcm.anchor}:${vcm.prevHash || 'null'}:${vcm.nextHash || 'null'}`;
-            return vcmKey === commentKey;
+            if (vcmKey !== commentKey) return false;
+
+            // If this is an inline comment, also match on the text to be more specific
+            if (commentAtCursor.type === "inline") {
+              return vcm.text === commentAtCursor.text;
+            }
+
+            return true;
           });
 
           if (!targetVcmComment) {
@@ -2307,7 +2318,7 @@ async function activate(context) {
         if (vcmCandidates.length === 1) {
           targetVcmComment = vcmCandidates[0];
         } else {
-          // Use context hashes to find best match
+          // Use context hashes + text to find best match
           let bestMatch = null;
           let bestScore = -1;
 
@@ -2318,6 +2329,10 @@ async function activate(context) {
             }
             if (currentComment.nextHash && vcm.nextHash === currentComment.nextHash) {
               score += 10;
+            }
+            // For inline comments, exact text match is highest priority
+            if (isInlineComment && currentComment.text === vcm.text) {
+              score += 100;
             }
             if (score > bestScore) {
               bestScore = score;
@@ -2514,8 +2529,78 @@ async function activate(context) {
           vscode.window.showInformationMessage("VCM: Private comments hidden 🔒");
         } else {
           // Show private comments - inject them back
-          // Pass true to includePrivate to inject them
-          newText = injectComments(text, privateComments, true);
+          // For inline private comments on the same line as shared comments, prepend them
+
+          // Load shared comments to check for inline comments on same lines
+          const { sharedComments } = await loadAllComments(relativePath);
+
+          // Build a map of private inline comments by anchor
+          const privateInlinesByAnchor = new Map();
+          for (const privateComment of privateComments) {
+            if (privateComment.type === "inline") {
+              const key = `${privateComment.anchor}:${privateComment.prevHash || 'null'}:${privateComment.nextHash || 'null'}`;
+              privateInlinesByAnchor.set(key, privateComment);
+            }
+          }
+
+          // Check which shared inline comments have private inline comments on the same line
+          const commentsToInject = [...privateComments];
+          for (const sharedComment of sharedComments) {
+            if (sharedComment.type === "inline") {
+              const key = `${sharedComment.anchor}:${sharedComment.prevHash || 'null'}:${sharedComment.nextHash || 'null'}`;
+              const matchingPrivate = privateInlinesByAnchor.get(key);
+
+              if (matchingPrivate) {
+                // Found a private inline comment on the same line as a shared one
+                // Create a merged comment with private text prepended to shared text
+                const mergedComment = {
+                  ...sharedComment,
+                  text: (matchingPrivate.text || "") + (sharedComment.text || "")
+                };
+
+                // Remove the private comment from injection list (we'll use merged instead)
+                const privateIdx = commentsToInject.findIndex(c =>
+                  c.type === "inline" &&
+                  c.anchor === matchingPrivate.anchor &&
+                  (c.prevHash || 'null') === (matchingPrivate.prevHash || 'null') &&
+                  (c.nextHash || 'null') === (matchingPrivate.nextHash || 'null') &&
+                  c.text === matchingPrivate.text
+                );
+                if (privateIdx >= 0) {
+                  commentsToInject.splice(privateIdx, 1);
+                }
+
+                // Remove the shared comment and add the merged one
+                const sharedIdx = commentsToInject.findIndex(c =>
+                  c.type === "inline" &&
+                  c.anchor === sharedComment.anchor &&
+                  (c.prevHash || 'null') === (sharedComment.prevHash || 'null') &&
+                  (c.nextHash || 'null') === (sharedComment.nextHash || 'null') &&
+                  c.text === sharedComment.text
+                );
+                if (sharedIdx >= 0) {
+                  commentsToInject.splice(sharedIdx, 1);
+                }
+
+                commentsToInject.push(mergedComment);
+              } else {
+                // No matching private comment, just add the shared comment
+                const alreadyExists = commentsToInject.some(c =>
+                  c.type === "inline" &&
+                  c.anchor === sharedComment.anchor &&
+                  (c.prevHash || 'null') === (sharedComment.prevHash || 'null') &&
+                  (c.nextHash || 'null') === (sharedComment.nextHash || 'null') &&
+                  c.text === sharedComment.text
+                );
+                if (!alreadyExists) {
+                  commentsToInject.push(sharedComment);
+                }
+              }
+            }
+          }
+
+          // Inject the combined comments
+          newText = injectComments(text, commentsToInject, true);
 
           privateCommentsVisible.set(doc.uri.fsPath, true);
 
