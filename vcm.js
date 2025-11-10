@@ -368,7 +368,7 @@ async function detectInitialMode(doc, vcmDir) {
       // each singular comment
       const comment = nonAlwaysShowComments[i];
       // where the comment used to be (saved in metadata when comments were last toggled).
-      const lineIndex = comment.originalLine;
+      const lineIndex = comment.originalLineIndex;
 
       // If that comment index is beyond the end of the current file, skip.
       if (lineIndex >= lines.length) continue;
@@ -473,7 +473,7 @@ function extractComments(text, filePath) {
       // Store the ENTIRE line as-is (includes indent, marker, spacing, text, trailing spaces)
       commentBuffer.push({
         text: line,           // Full line exactly as it appears
-        originalLine: i,      // 0-based line index
+        originalLineIndex: i,      // 0-based line index
       });
       continue; // Don’t finalize it yet. move to next line. You might be in the middle of a comment block.
     }
@@ -495,7 +495,7 @@ function extractComments(text, filePath) {
         if (nextNonBlankIdx >= 0 && isComment(lines[nextNonBlankIdx])) {
           commentBuffer.push({
             text: line,           // Empty or whitespace-only line
-            originalLine: i,      // 0-based line index
+            originalLineIndex: i,      // 0-based line index
           });
           continue;
         }
@@ -526,7 +526,7 @@ function extractComments(text, filePath) {
         anchor: hashLine(anchorBase, 0), // hash of the line’s code (for identification later),
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
-        originalLine: i, // the line number it appeared on (changes per mode so not reliable alone)
+        originalLineIndex: i, // the line number it appeared on (changes per mode so not reliable alone)
         text: fullComment,  // Store ALL inline comments as one combined text
       });
     }
@@ -535,7 +535,7 @@ function extractComments(text, filePath) {
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
       // Count blank lines BEFORE the first comment line
-      const firstCommentLine = commentBuffer[0].originalLine;
+      const firstCommentLine = commentBuffer[0].originalLineIndex;
       let leadingBlankLines = 0; // keep count
       for (let j = firstCommentLine - 1; j >= 0; j--) {
         if (!lines[j].trim()) {
@@ -546,7 +546,7 @@ function extractComments(text, filePath) {
       }
 
       // Count blank lines AFTER the last comment (between comment and this code line)
-      const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLine;
+      const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLineIndex;
       const trailingBlankLines = i - lastCommentLine - 1;
 
       // Store context again: previous code line and next code line
@@ -701,32 +701,51 @@ function injectComments(cleanText, comments, includePrivate = false) {
     return scores[0].idx; // Return the index with highest contextual match.
   };
 
-  // Separate block comments by type and sort by originalLine
+  // Separate block comments by type and sort by originalLineIndex
   // Ensure that when you loop through comments, they’re in natural file order, not random JSON order.
-  // .sort(...) orders the comment blocks from top to bottom according to where they originally appeared in the file.
+  // .sort(...) orders the comment blocks from top to bottom according to where they originally appeared by line number in the file.
   // That way, when you inject them, they’re added in the same vertical order they were extracted.
   const blockComments = commentsToInject.filter(c => c.type === "block").sort((a, b) => {
-    const aLine = a.block[0]?.originalLine || 0;
-    const bLine = b.block[0]?.originalLine || 0;
-    return aLine - bLine; // sort them ascending (top of file first).
+    // Each block comment object has a block array. each el = 1 comment line of the block
+    // a.block[0]?.originalLineIndex → accesses the first line of that block (top of the comment) and gets its original line number in the old file.
+    // The ?. (optional chaining) avoids errors if block or [0] doesn’t exist (so it returns undefined instead of crashing).
+    // || 0 = “if we can’t find its original position, assume line 0.”
+    const aLine = a.block[0]?.originalLineIndex || 0; 
+    const bLine = b.block[0]?.originalLineIndex || 0;
+    return aLine - bLine; // sort them ascending (smallest line number - top of file first).
   });
-  const inlineComments = commentsToInject.filter(c => c.type === "inline").sort((a, b) => a.originalLine - b.originalLine);
+  const inlineComments = commentsToInject.filter(c => c.type === "inline").sort((a, b) => a.originalLineIndex - b.originalLineIndex);
 
   // Track which indices we've already used
   const usedIndices = new Set();
 
-  // Build maps: line index -> comment
+  // Build maps: Map() is a key-value store where keys can be any type.
+  // key = line index of code
+  // value = array of block comment objects that attach to that code line.
+  // This is what injectComments() uses later to decide “for line i, which comments go above it?”
   const blockMap = new Map();
-  
-  for (const block of blockComments) {
-    const indices = lineHashToIndices.get(block.anchor);
-    if (indices && indices.length > 0) {
-      const targetIndex = findBestMatch(block, indices, usedIndices);
-      usedIndices.add(targetIndex); // Adds the target index to usedIndices so you don’t double-assign it.
 
+  // Loops through every block comment that needs to be inserted.
+  for (const block of blockComments) {
+    // indices is an array of potential candidate line numbers where that code exists now.
+    // lineHashToIndices maps a hash of a code line → all possible line indices in the current document that match that code’s hash.
+    // block.anchor is that hash value — it’s how we know which code line this comment originally belonged to.
+    const indices = lineHashToIndices.get(block.anchor);
+    // Only proceed if the anchor’s code still exists in the file (non-null and non-empty array).
+    if (indices && indices.length > 0) {
+      // findBestMatch() decides which of those possible indices best matches this comment.
+      // Example: if that same code line appears twice in the file, it picks the one nearest to where the comment used to be.
+      // It also receives usedIndices to avoid assigning a block to an index already taken.
+      const targetIndex = findBestMatch(block, indices, usedIndices);
+      usedIndices.add(targetIndex); // Adds the target index to usedIndices (taken) so you don’t double-assign it.
+
+      // if the map doesnt exist yet for this index
       if (!blockMap.has(targetIndex)) {
+        // initialize an empty array for it
         blockMap.set(targetIndex, []);
       }
+      // Actually stores the comment object(s) in that array — meaning:
+      // “When reinjecting, for this line index, insert this block comment above it.”
       blockMap.get(targetIndex).push(block);
     }
   }
@@ -1001,32 +1020,32 @@ function stripComments(text, filePath, vcmComments = [], keepPrivate = false) {
       // Track all lines in all comment blocks (including blank lines WITHIN them)
       // But DO NOT track leading/trailing blank lines - those should stay visible in ALL modes
       for (const blockLine of current.block) {
-        allCommentBlockLines.add(blockLine.originalLine);
+        allCommentBlockLines.add(blockLine.originalLineIndex);
       }
 
       // If this block is alwaysShow, also add to alwaysShow set
       if (alwaysShowAnchors.has(current.anchor)) {
         for (const blockLine of current.block) {
-          alwaysShowLines.add(blockLine.originalLine);
+          alwaysShowLines.add(blockLine.originalLineIndex);
         }
       }
 
       // If this block is private and we're keeping private, add to private set
       if (privateAnchors.has(current.anchor)) {
         for (const blockLine of current.block) {
-          privateLines.add(blockLine.originalLine);
+          privateLines.add(blockLine.originalLineIndex);
         }
       }
     } else if (current.type === "inline") {
       if (alwaysShowAnchors.has(current.anchor)) {
         // For alwaysShow inline comments, store the line index and text
-        alwaysShowLines.add(current.originalLine);
-        alwaysShowInlineComments.set(current.originalLine, current.text || "");
+        alwaysShowLines.add(current.originalLineIndex);
+        alwaysShowInlineComments.set(current.originalLineIndex, current.text || "");
       }
       if (privateAnchors.has(current.anchor)) {
         // For private inline comments (if keeping), store the line index and text
-        privateLines.add(current.originalLine);
-        privateInlineComments.set(current.originalLine, current.text || "");
+        privateLines.add(current.originalLineIndex);
+        privateInlineComments.set(current.originalLineIndex, current.text || "");
       }
     }
   }
@@ -1221,7 +1240,7 @@ async function activate(context) {
             // Extract current comments and match by line
             const currentComments = extractComments(doc.getText(), doc.uri.path);
             const matchingCurrent = currentComments.find(curr =>
-              curr.anchor === anchorHash && curr.originalLine === selectedLine
+              curr.anchor === anchorHash && curr.originalLineIndex === selectedLine
             );
             if (matchingCurrent) {
               if (c.alwaysShow) isAlwaysShow = true;
@@ -2005,7 +2024,7 @@ async function activate(context) {
             targetComment = candidates[0];
           } else {
             // Multiple comments with same anchor - use line number to disambiguate
-            targetComment = candidates.find(c => c.originalLine === selectedLine);
+            targetComment = candidates.find(c => c.originalLineIndex === selectedLine);
             if (!targetComment) {
               targetComment = candidates[0]; // Fallback to first match
             }
@@ -2028,7 +2047,7 @@ async function activate(context) {
           }
 
           // Find the current comment at the selected line
-          let currentComment = currentCandidates.find(c => c.originalLine === selectedLine);
+          let currentComment = currentCandidates.find(c => c.originalLineIndex === selectedLine);
           if (!currentComment && currentCandidates.length > 0) {
             currentComment = currentCandidates[0]; // Fallback
           }
@@ -2212,13 +2231,13 @@ async function activate(context) {
           if (matchingComment) {
             if (matchingComment.type === "block" && matchingComment.block) {
               // Remove all lines in the block (from first to last)
-              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLine));
-              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLine));
+              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLineIndex));
+              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLineIndex));
               const range = new vscode.Range(firstLine, 0, lastLine + 1, 0);
               edit.delete(doc.uri, range);
             } else if (matchingComment.type === "inline") {
               // Remove just the inline comment part (keep the code)
-              const lineText = lines[matchingComment.originalLine];
+              const lineText = lines[matchingComment.originalLineIndex];
               const commentMarkers = getCommentMarkersForFile(doc.uri.path);
 
               // Find where the comment starts
@@ -2233,8 +2252,8 @@ async function activate(context) {
 
               if (commentStartIdx >= 0) {
                 const range = new vscode.Range(
-                  matchingComment.originalLine, commentStartIdx,
-                  matchingComment.originalLine, lineText.length
+                  matchingComment.originalLineIndex, commentStartIdx,
+                  matchingComment.originalLineIndex, lineText.length
                 );
                 edit.delete(doc.uri, range);
               }
@@ -2301,12 +2320,12 @@ async function activate(context) {
         // Find the comment at the cursor position to get its hashes
         const commentAtCursor = currentComments.find(c => {
           if (isInlineComment) {
-            return c.type === "inline" && c.originalLine === selectedLine;
+            return c.type === "inline" && c.originalLineIndex === selectedLine;
           } else {
             // For block comments, check if cursor is within the block
             if (c.type === "block" && c.block) {
-              const firstLine = c.block[0].originalLine;
-              const lastLine = c.block[c.block.length - 1].originalLine;
+              const firstLine = c.block[0].originalLineIndex;
+              const lastLine = c.block[c.block.length - 1].originalLineIndex;
               return selectedLine >= firstLine && selectedLine <= lastLine;
             }
             return false;
@@ -2367,12 +2386,12 @@ async function activate(context) {
 
             if (commentAtCursor.type === "block" && commentAtCursor.block) {
               // Remove the entire block
-              const firstLine = commentAtCursor.block[0].originalLine;
-              const lastLine = commentAtCursor.block[commentAtCursor.block.length - 1].originalLine;
+              const firstLine = commentAtCursor.block[0].originalLineIndex;
+              const lastLine = commentAtCursor.block[commentAtCursor.block.length - 1].originalLineIndex;
               edit.delete(doc.uri, new vscode.Range(firstLine, 0, lastLine + 1, 0));
             } else if (commentAtCursor.type === "inline") {
               // Remove inline comment from the line
-              const currentLine = doc.lineAt(commentAtCursor.originalLine);
+              const currentLine = doc.lineAt(commentAtCursor.originalLineIndex);
               const commentMarkers = getCommentMarkersForFile(doc.uri.path);
               let commentStartIdx = -1;
 
@@ -2520,7 +2539,7 @@ async function activate(context) {
         }
 
         // Find the current comment at the selected line
-        let currentComment = currentCandidates.find(c => c.originalLine === selectedLine);
+        let currentComment = currentCandidates.find(c => c.originalLineIndex === selectedLine);
         if (!currentComment && currentCandidates.length > 0) {
           currentComment = currentCandidates[0]; // Fallback
         }
@@ -2586,13 +2605,13 @@ async function activate(context) {
           if (matchingComment) {
             if (matchingComment.type === "block" && matchingComment.block) {
               // Remove all lines in the block (from first to last)
-              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLine));
-              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLine));
+              const firstLine = Math.min(...matchingComment.block.map(b => b.originalLineIndex));
+              const lastLine = Math.max(...matchingComment.block.map(b => b.originalLineIndex));
               const range = new vscode.Range(firstLine, 0, lastLine + 1, 0);
               edit.delete(doc.uri, range);
             } else if (matchingComment.type === "inline") {
               // Remove just the inline comment part (keep the code)
-              const lineText = lines[matchingComment.originalLine];
+              const lineText = lines[matchingComment.originalLineIndex];
 
               // Find where the comment starts
               let commentStartIndex = -1;
@@ -2607,9 +2626,9 @@ async function activate(context) {
 
               if (commentStartIndex > 0) {
                 const range = new vscode.Range(
-                  matchingComment.originalLine,
+                  matchingComment.originalLineIndex,
                   commentStartIndex,
-                  matchingComment.originalLine,
+                  matchingComment.originalLineIndex,
                   lineText.length
                 );
                 edit.delete(doc.uri, range);
@@ -2709,7 +2728,7 @@ async function activate(context) {
           for (const block of privateBlocksToRemove) {
             if (block.block) {
               for (const blockLine of block.block) {
-                linesToRemove.add(blockLine.originalLine);
+                linesToRemove.add(blockLine.originalLineIndex);
               }
             }
           }
@@ -2723,7 +2742,7 @@ async function activate(context) {
             let line = lines[i];
 
             // Check if this line has a private inline comment to remove
-            const inlineToRemove = privateInlinesToRemove.find(c => c.originalLine === i);
+            const inlineToRemove = privateInlinesToRemove.find(c => c.originalLineIndex === i);
             if (inlineToRemove) {
               // Remove the inline comment using the same logic as stripComments
               const commentMarkers = getCommentMarkersForFile(doc.uri.path);
