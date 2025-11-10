@@ -290,13 +290,22 @@ async function detectInitialMode(doc, vcmDir) {
 
       // text currently at this position
       const currentLine = lines[lineIndex];
-      // if its an inline comment
-      const commentText = comment.type === 'inline'
-        ? comment.text // use comment.text
-        // else if its a block comment and has a first index,
-        // then commentText is the block text else empty string
-        : (comment.block && comment.block[0] ? comment.block[0].text : '');
-      
+
+      // Check text_cleanMode first (newly typed comments in clean mode), then fall back to VCM text
+      let commentText;
+      if (comment.type === 'inline') {
+        commentText = comment.text_cleanMode || comment.text;
+      } else {
+        // For block comments, check text_cleanMode first
+        if (comment.text_cleanMode && comment.text_cleanMode[0]) {
+          commentText = comment.text_cleanMode[0].text;
+        } else if (comment.block && comment.block[0]) {
+          commentText = comment.block[0].text;
+        } else {
+          commentText = '';
+        }
+      }
+
       // if commentText exists and the current line doesnt include it
       if (commentText && !currentLine.includes(commentText)) {
         return false; // Comment not found - we're in clean mode
@@ -327,10 +336,10 @@ async function detectInitialMode(doc, vcmDir) {
 }
 
 // -----------------------------------------------------------------------------
-// Comment Extraction 
+// Comment Extraction
 // -----------------------------------------------------------------------------
 // text: the entire file content (string), filePath: the full path
-function extractComments(text, filePath, existingVCMComments = null, isCleanMode = false) {
+function extractComments(text, filePath, existingVCMComments = null, isCleanMode = false, debugAnchorText = false) {
   const lines = text.split("\n"); // Splits file text into an array of individual lines.
   const comments = [];      // Final array of all extracted comments
   let commentBuffer = [];   // Temporary holding area for consecutive comment lines
@@ -424,14 +433,21 @@ function extractComments(text, filePath, existingVCMComments = null, isCleanMode
       // Hash only the code portion before the first inline comment marker
       const anchorBase = line.substring(0, commentStartIndex).trimEnd();
 
-      comments.push({
+      const inlineComment = {
         type: "inline",
-        anchor: hashLine(anchorBase, 0), // hash of the line’s code (for identification later),
+        anchor: hashLine(anchorBase, 0), // hash of the line's code (for identification later),
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         originalLineIndex: i, // the line number it appeared on (changes per mode so not reliable alone)
         text: fullComment,  // Store ALL inline comments as one combined text
-      });
+      };
+
+      // Add debug anchor text if enabled
+      if (debugAnchorText) {
+        inlineComment.anchorText = anchorBase;
+      }
+
+      comments.push(inlineComment);
     }
 
     // CASE 3: We have buffered comment lines (comment group) above this code line
@@ -445,14 +461,21 @@ function extractComments(text, filePath, existingVCMComments = null, isCleanMode
       // Only store the actual comment lines (which may include blanks BETWEEN comment lines)
       const fullBlock = commentBuffer;
 
-      comments.push({
+      const blockComment = {
         type: "block",
         anchor: hashLine(line, 0), // Just content hash
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         insertAbove: true, // when re-adding comments, they should appear above that line.
         block: fullBlock,
-      });
+      };
+
+      // Add debug anchor text if enabled
+      if (debugAnchorText) {
+        blockComment.anchorText = line;
+      }
+
+      comments.push(blockComment);
       commentBuffer = []; // Clear buffer for next block
     }
   }
@@ -467,15 +490,22 @@ function extractComments(text, filePath, existingVCMComments = null, isCleanMode
     // For file header comments, there's no previous code line
     const nextIdx = findNextCodeLine(anchorLine - 1);
 
-    // Insert this block at the beginning of the comments array
-    comments.unshift({
+    const headerComment = {
       type: "block",
       anchor: hashLine(lines[anchorLine] || "", 0), // Just content hash
       prevHash: null, // No previous code line before file header
       nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
       insertAbove: true,
       block: commentBuffer,
-    });
+    };
+
+    // Add debug anchor text if enabled
+    if (debugAnchorText) {
+      headerComment.anchorText = lines[anchorLine] || "";
+    }
+
+    // Insert this block at the beginning of the comments array
+    comments.unshift(headerComment);
   }
 
   return comments;
@@ -915,6 +945,7 @@ async function activate(context) {
   const config = vscode.workspace.getConfiguration("vcm");
   const autoSplit = config.get("autoSplitView", true);  // Auto-split vs same pane
   const liveSync = config.get("liveSync", false);       // Auto-save .vcm on edit
+  const debugAnchorText = config.get("debugAnchorText", true); // Store anchor line text for debugging
 
   // Create .vcm directory in workspace root
   // This stores .vcm.json files that mirror the comment structure
@@ -1220,18 +1251,23 @@ async function activate(context) {
     const { sharedComments: existingComments, privateComments: existingPrivateComments } = await loadAllComments(relativePath);
 
     // Get the current mode from our state map
+    // IMPORTANT: Once mode is set, it should NEVER change except via manual toggle or undo/redo
     let isCommented = isCommentedMap.get(doc.uri.fsPath);
 
     // If state is not set, initialize it by detecting the mode
+    // This only happens on first open or after a restart
     if (isCommented === undefined) {
       isCommented = await detectInitialMode(doc, vcmDir);
       isCommentedMap.set(doc.uri.fsPath, isCommented);
     }
 
+    // Debug: Never re-detect mode during normal saves - mode should be stable
+    // The mode is managed by toggles and undo/redo detection in split view sync
+
     // Extract all current comments from the document
     // Pass mode and existing comments so blank lines are handled correctly
     const isCleanMode = !isCommented;
-    const currentComments = extractComments(text, doc.uri.path, existingComments, isCleanMode);
+    const currentComments = extractComments(text, doc.uri.path, existingComments, isCleanMode, debugAnchorText);
 
     // ------------------------------------------------------------------------
     // Merge Strategy
@@ -1385,6 +1421,22 @@ async function activate(context) {
           privateKeys.add(key);
         }
 
+        // Build a map of existing comments by their text_cleanMode content for matching
+        const existingByTextCleanMode = new Map();
+        for (const existing of existingComments) {
+          if (existing.text_cleanMode) {
+            const textKey = typeof existing.text_cleanMode === 'string'
+              ? existing.text_cleanMode
+              : (Array.isArray(existing.text_cleanMode) ? existing.text_cleanMode.map(b => b.text).join('\n') : '');
+            if (textKey && !existingByTextCleanMode.has(textKey)) {
+              existingByTextCleanMode.set(textKey, existing);
+            }
+          }
+        }
+
+        // Track which existing comments we've matched
+        const matchedInCleanMode = new Set();
+
         // Process current comments (typed in clean mode)
         // IMPORTANT: Filter out private comments - they should never be added to shared VCM
         for (const current of currentComments) {
@@ -1395,22 +1447,40 @@ async function activate(context) {
             continue;
           }
 
-          const candidates = existingByKey.get(key) || [];
+          const currentText = current.text || (current.block ? current.block.map(b => b.text).join('\n') : '');
+          let existing = null;
 
-          if (candidates.length > 0) {
-            // Found matching existing comment - update its text_cleanMode
-            const existing = candidates[0]; // Use first match (could improve with context matching)
+          // First, try to match by text_cleanMode content (handles anchor changes when code moves)
+          if (currentText && existingByTextCleanMode.has(currentText)) {
+            const candidate = existingByTextCleanMode.get(currentText);
+            if (!matchedInCleanMode.has(candidate)) {
+              existing = candidate;
+              matchedInCleanMode.add(existing);
+              // Update anchor to new position (comment moved with code)
+              existing.anchor = current.anchor;
+              existing.prevHash = current.prevHash;
+              existing.nextHash = current.nextHash;
+            }
+          }
 
+          // If no text match, try anchor match (for VCM comments)
+          if (!existing) {
+            const candidates = existingByKey.get(key) || [];
+            if (candidates.length > 0 && !matchedInCleanMode.has(candidates[0])) {
+              existing = candidates[0];
+              matchedInCleanMode.add(existing);
+            }
+          }
+
+          if (existing) {
+            // Update text_cleanMode
             if (current.type === "inline") {
-              // For inline comments, only store if different from existing text
-              // If identical, set to null to avoid double injection
               if (current.text !== existing.text) {
                 existing.text_cleanMode = current.text;
               } else {
                 existing.text_cleanMode = null;
               }
             } else if (current.type === "block") {
-              // For block comments, compare only the text content (ignore line indices)
               const existingTexts = existing.block?.map(b => b.text).join('\n') || '';
               const currentTexts = current.block?.map(b => b.text).join('\n') || '';
               const blocksIdentical = existingTexts === currentTexts;
@@ -1422,30 +1492,34 @@ async function activate(context) {
               }
             }
           } else {
-            // No existing comment - create new one with text_cleanMode
+            // No match - this is a newly typed comment in clean mode
             const newComment = { ...current };
             if (current.type === "inline") {
               newComment.text_cleanMode = current.text;
               delete newComment.text;
             } else if (current.type === "block") {
-              // For block comments, store the block array in text_cleanMode
               newComment.text_cleanMode = current.block;
               delete newComment.block;
             }
             existingComments.push(newComment);
+            matchedInCleanMode.add(newComment);
           }
         }
 
-        // Remove text_cleanMode from comments that are no longer present
+        // Remove text_cleanMode from comments that were deleted in clean mode
+        // Only clear text_cleanMode if we previously had it (meaning user typed it then deleted it)
+        // Don't touch text_cleanMode if it was already null (comment is hidden in clean mode)
         for (const existing of existingComments) {
-          const key = `${existing.type}:${existing.anchor}`;
-          const stillExists = currentComments.some(c =>
-            `${c.type}:${c.anchor}` === key
-          );
+          if (existing.text_cleanMode) {
+            const key = `${existing.type}:${existing.anchor}`;
+            const stillExists = currentComments.some(c =>
+              `${c.type}:${c.anchor}` === key
+            );
 
-          if (!stillExists) {
-            // User deleted this comment in clean mode
-            existing.text_cleanMode = null;
+            if (!stillExists) {
+              // User deleted this comment in clean mode
+              existing.text_cleanMode = null;
+            }
           }
         }
 
