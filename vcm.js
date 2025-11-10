@@ -220,91 +220,6 @@ function hashLine(line, lineIndex) {
   // Ex: "x = 5" -> "a3f2b1c4"
 }
 
-// Merge new comments with existing VCM comments using hash matching
-// This is used when toggling from clean mode to commented mode
-// Returns: merged array of comments with new text prepended to existing
-function mergeCommentsWithVCM(newComments, existingComments) {
-  // Build a map of anchor hash -> array of existing comments (handles duplicate anchors)
-  const existingByAnchor = new Map();
-  for (const old of existingComments) {
-    if (!existingByAnchor.has(old.anchor)) {
-      existingByAnchor.set(old.anchor, []);
-    }
-    existingByAnchor.get(old.anchor).push(old);
-  }
-
-  // Helper: Find best matching existing comment using context hashes
-  const findBestExistingMatch = (newComment, candidates) => {
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
-
-    // Score each candidate based on context hash matching
-    const scores = candidates.map(existing => {
-      let score = 0;
-
-      // Match prevHash
-      if (newComment.prevHash && existing.prevHash) {
-        if (newComment.prevHash === existing.prevHash) score += 10;
-      }
-
-      // Match nextHash
-      if (newComment.nextHash && existing.nextHash) {
-        if (newComment.nextHash === existing.nextHash) score += 10;
-      }
-
-      return { existing, score };
-    });
-
-    // Sort by score (highest first)
-    scores.sort((a, b) => b.score - a.score);
-
-    return scores[0].existing;
-  };
-
-  // Track which existing comments have been matched
-  const usedExisting = new Set();
-
-  // Process new comments and merge with existing BY MODIFYING IN PLACE
-  for (const newC of newComments) {
-    const candidates = existingByAnchor.get(newC.anchor) || [];
-    const availableCandidates = candidates.filter(c => !usedExisting.has(c));
-
-    if (availableCandidates.length > 0) {
-      // Find the best matching existing comment using context hashes
-      const existing = findBestExistingMatch(newC, availableCandidates);
-      usedExisting.add(existing);
-
-      if (newC.type === "block" && existing.type === "block") {
-        // Prepend new block lines ABOVE existing block (modify in place)
-        const existingTexts = existing.block.map(b => b.text?.trim());
-
-        // Only add new block lines that don't already exist
-        const uniqueNewBlocks = newC.block.filter(nb =>
-          !existingTexts.includes(nb.text?.trim())
-        );
-
-        if (uniqueNewBlocks.length > 0) {
-          existing.block = [...uniqueNewBlocks, ...existing.block];
-        }
-      } else if (newC.type === "inline" && existing.type === "inline") {
-        // Check if new text already exists in the existing text
-        const newText = newC.text || "";
-        const existingText = existing.text || "";
-
-        if (!existingText.includes(newText.trim())) {
-          // Prepend new comment to existing comment (both include markers)
-          // Example: "  # new" + "  # old" = "  # new  # old"
-          existing.text = newText + existingText;
-        }
-      }
-    }
-  }
-
-  // Return existing comments in their ORIGINAL ORDER (not reordered)
-  return existingComments;
-}
-
 // Detect initial state: are comments visible or hidden?
 // Returns: true if comments are visible (isCommented), false if in clean mode
 async function detectInitialMode(doc, vcmDir) {
@@ -1719,9 +1634,41 @@ async function activate(context) {
   });
   context.subscriptions.push(splitViewSyncWatcher);
 
+  // Helper function to close split view tab and clean up
+  const closeSplitView = async () => {
+    if (tempUri) {
+      try {
+        // Find the specific VCM tab and close only that tab (not the whole pane)
+        const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
+        const vcmTab = allTabs.find(tab => {
+          if (tab.input instanceof vscode.TabInputText) {
+            return tab.input.uri.toString() === tempUri.toString();
+          }
+          return false;
+        });
+
+        if (vcmTab) {
+          await vscode.window.tabGroups.close(vcmTab);
+        }
+      } catch {
+        // ignore errors if already closed
+      }
+    }
+    
+    // Clean up our own references
+    vcmEditor = null;
+    tempUri = null;
+    sourceDocUri = null;
+    if (scrollListener) {
+      scrollListener.dispose();
+      scrollListener = null;
+    }
+  };
+
   // Clean up when split view is closed (always, not just when liveSync is enabled)
   const closeWatcher = vscode.workspace.onDidCloseTextDocument((doc) => {
     if (tempUri && doc.uri.toString() === tempUri.toString()) {
+      // Split view document was closed
       vcmEditor = null;
       tempUri = null;
       sourceDocUri = null;
@@ -1729,9 +1676,25 @@ async function activate(context) {
         scrollListener.dispose();
         scrollListener = null;
       }
+    } else if (sourceDocUri && doc.uri.toString() === sourceDocUri.toString()) {
+      // Source document was closed - close the split view too
+      closeSplitView();
     }
   });
   context.subscriptions.push(closeWatcher);
+
+  // Monitor visible editors - close split view if source is no longer visible
+  const visibleEditorsWatcher = vscode.window.onDidChangeVisibleTextEditors((editors) => {
+    // If we have a split view open, check if source is still visible
+    if (sourceDocUri && tempUri) {
+      const sourceVisible = editors.some(e => e.document.uri.toString() === sourceDocUri.toString());
+      if (!sourceVisible) {
+        // Source is no longer visible - close the split view
+        closeSplitView();
+      }
+    }
+  });
+  context.subscriptions.push(visibleEditorsWatcher);
 
   // ---------------------------------------------------------------------------
   // COMMAND: Toggle same file (hide/show comments)
@@ -2842,6 +2805,12 @@ async function activate(context) {
     if (!editor) return;
 
     const doc = editor.document;
+
+    // Close any existing VCM split view before opening a new one (only one VCM_ allowed)
+    if (tempUri) {
+      await closeSplitView();
+    }
+
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
     const baseName = doc.fileName.split(/[\\/]/).pop();
@@ -2883,15 +2852,12 @@ async function activate(context) {
     tempUri = vscode.Uri.parse(`vcm-view:${uniqueLabel}`);
     provider.update(tempUri, showVersion);
 
-
-    // Collapse any existing split groups to start fresh
-    await vscode.commands.executeCommand("workbench.action.joinAllGroups");
-    
-    // Open in split view (beside) or same pane based on config
-    const targetColumn = autoSplit ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active;
+    // Open in a proper split pane (like "Open to the Side")
+    // Use ViewColumn.Beside to open in a new editor group to the side
     vcmEditor = await vscode.window.showTextDocument(tempUri, {
-      viewColumn: targetColumn,
-      preview: true,  // Use preview tab (can be replaced)
+      viewColumn: vscode.ViewColumn.Beside,
+      preview: false,  // Don't use preview mode so it persists as a tab
+      preserveFocus: true  // Keep focus on source editor
     });
 
     // Track which source document has the split view open for live sync
