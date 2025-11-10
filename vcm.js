@@ -750,6 +750,8 @@ function injectComments(cleanText, comments, includePrivate = false) {
     }
   }
 
+  // Same logic as blockMap, but this one tracks inline comments.
+  // Key = line index of code line, value = array of inline comments that go on that line.
   const inlineMap = new Map();
   for (const inline of inlineComments) {
     const indices = lineHashToIndices.get(inline.anchor);
