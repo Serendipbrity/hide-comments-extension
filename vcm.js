@@ -853,9 +853,10 @@ function injectComments(cleanText, comments, includePrivate = false) {
             result.push(c.text);
           }
 
-        // Add trailing blanks
-        for (const blank of trailingBlankLines) {
-          result.push(blank);
+          // Add trailing blanks
+          for (const blank of trailingBlankLines) {
+            result.push(blank);
+          }
         }
       }
     }
@@ -2978,22 +2979,21 @@ async function activate(context) {
     });
     context.subscriptions.push(scrollListener);
 
-
-        // Decorate the banner
-        const banner = vscode.window.createTextEditorDecorationType({
-          isWholeLine: true,
-          before: {
-            contentText: `💬 ${vcmLabel} (${labelType})`,
-            color: "#00ff88",
-            fontWeight: "bold",
-            backgroundColor: "#00330088",
-            margin: "0 1rem 0 0",
-          },
-        });
-        vcmEditor.setDecorations(banner, [new vscode.Range(0, 0, 0, 0)]);
-      });
-      context.subscriptions.push(toggleSplitView);
-    }
+    // Decorate the banner
+    const banner = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true,
+      before: {
+        contentText: `💬 ${vcmLabel} (${labelType})`,
+        color: "#00ff88",
+        fontWeight: "bold",
+        backgroundColor: "#00330088",
+        margin: "0 1rem 0 0",
+      },
+    });
+    vcmEditor.setDecorations(banner, [new vscode.Range(0, 0, 0, 0)]);
+  });
+  context.subscriptions.push(toggleSplitView);
+}
 
 // Extension deactivation - cleanup resources
 function deactivate() {
