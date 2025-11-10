@@ -415,13 +415,20 @@ async function detectInitialMode(doc, vcmDir) {
 // Comment Extraction 
 // -----------------------------------------------------------------------------
 // text: the entire file content (string), filePath: the full path
-function extractComments(text, filePath) {
+function extractComments(text, filePath, existingVCMComments = null, isCleanMode = false) {
   const lines = text.split("\n"); // Splits file text into an array of individual lines.
   const comments = [];      // Final array of all extracted comments
   let commentBuffer = [];   // Temporary holding area for consecutive comment lines
 
   // Get comment markers for this file type from our centralized config list
   const commentMarkers = getCommentMarkersForFile(filePath);
+
+  // In clean mode, create a helper to check if a code line has VCM comments attached
+  const codeLineHasVCMComments = (lineIndex) => {
+    if (!isCleanMode || !existingVCMComments) return false;
+    const lineHash = hashLine(lines[lineIndex], 0);
+    return existingVCMComments.some(c => c.anchor === lineHash);
+  };
 
   // Build regex pattern for this file type
   // .replace() escapes special regex characters like *, ?, (, ), etc., because // or % would otherwise break the regex engine.
@@ -480,9 +487,9 @@ function extractComments(text, filePath) {
 
     // CASE 1.5: Currently on Blank line - check if it's within a comment block
     if (!trimmed) { // if no (trimmed) lines
-      // If we have comments buffered (grouped), check if the next non-blank line is also a comment
+      // If we have comments buffered (grouped), include blank lines as part of the block
       if (commentBuffer.length > 0) {
-        let nextNonBlankIdx = -1; // initializes a “not-found” value.
+        let nextNonBlankIdx = -1; // initializes a "not-found" value.
         // Look ahead to find the next non-blank line
         for (let j = i + 1; j < lines.length; j++) {
           if (lines[j].trim()) {
@@ -491,16 +498,30 @@ function extractComments(text, filePath) {
           }
         }
 
-        // If the next non-blank line is a comment, this blank line is part of the block
+        // Include blank line if:
+        // 1. Next non-blank line is a comment (blank between comments), OR
+        // 2. In clean mode: next line is code that has VCM comments (blank would be between hidden comments)
         if (nextNonBlankIdx >= 0 && isComment(lines[nextNonBlankIdx])) {
+          // Blank line between comment lines
           commentBuffer.push({
             text: line,           // Empty or whitespace-only line
             originalLineIndex: i,      // 0-based line index
           });
           continue;
+        } else if (nextNonBlankIdx >= 0 && isCleanMode) {
+          // Next line is code, and we're in clean mode
+          // Only include blank if next code line has VCM comments attached
+          // (means blank is between this comment and a hidden VCM comment)
+          if (codeLineHasVCMComments(nextNonBlankIdx)) {
+            commentBuffer.push({
+              text: line,
+              originalLineIndex: i,
+            });
+          }
+          continue;
         }
       }
-      // Otherwise, skip this blank line (it's between blocks or code sections)
+      // Otherwise, skip this blank line (it's between blocks or before any comment)
       continue;
     }
 
@@ -534,24 +555,13 @@ function extractComments(text, filePath) {
     // CASE 3: We have buffered comment lines (comment group) above this code line
     // Attach the entire comment block to this line of code
     if (commentBuffer.length > 0) {
-      // Count blank lines BEFORE the first comment line
-      const firstCommentLine = commentBuffer[0].originalLineIndex;
-      let leadingBlankLines = 0; // keep count
-      for (let j = firstCommentLine - 1; j >= 0; j--) {
-        if (!lines[j].trim()) {
-          leadingBlankLines++;
-        } else {
-          break; // Hit code or another comment
-        }
-      }
-
-      // Count blank lines AFTER the last comment (between comment and this code line)
-      const lastCommentLine = commentBuffer[commentBuffer.length - 1].originalLineIndex;
-      const trailingBlankLines = i - lastCommentLine - 1;
-
-      // Store context again: previous code line and next code line
+      // Store context: previous code line and next code line
       const prevIdx = findPrevCodeLine(i);
       const nextIdx = findNextCodeLine(i);
+
+      // DO NOT include leading or trailing blanks - they should persist in clean mode as spacing
+      // Only store the actual comment lines (which may include blanks BETWEEN comment lines)
+      const fullBlock = commentBuffer;
 
       comments.push({
         type: "block",
@@ -559,9 +569,7 @@ function extractComments(text, filePath) {
         prevHash: prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null,
         nextHash: nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null,
         insertAbove: true, // when re-adding comments, they should appear above that line.
-        block: commentBuffer,
-        leadingBlankLines: leadingBlankLines > 0 ? leadingBlankLines : undefined,
-        trailingBlankLines: trailingBlankLines > 0 ? trailingBlankLines : undefined,
+        block: fullBlock,
       });
       commentBuffer = []; // Clear buffer for next block
     }
@@ -765,39 +773,7 @@ function injectComments(cleanText, comments, includePrivate = false) {
     }
   }
 
-  // First pass: identify which blank lines belong to comment spacing
-  // You’ll later use this to skip printing blank lines twice.
-  // If a blank belongs to a comment, you mark its index here and don’t push it again later in the rebuild loop.
-  const blankLinesOwnedByComments = new Set();
-
-  for (let i = 0; i < lines.length; i++) {
-    const blocks = blockMap.get(i);
-    if (blocks) {
-      for (const block of blocks) {
-        const leadingBlanks = block.leadingBlankLines || 0;
-        const trailingBlanks = block.trailingBlankLines || 0;
-        const totalBlanks = leadingBlanks + trailingBlanks;
-
-        // Find all consecutive blank lines before the anchor
-        const blankIndices = [];
-        for (let j = i - 1; j >= 0; j--) {
-          if (!lines[j].trim()) {
-            blankIndices.unshift(j); // Add to front to maintain order
-          } else {
-            break;
-          }
-        }
-
-        // Mark the appropriate blanks:
-        // First N are leading, next M are trailing
-        for (let idx = 0; idx < Math.min(blankIndices.length, totalBlanks); idx++) {
-          blankLinesOwnedByComments.add(blankIndices[idx]);
-        }
-      }
-    }
-  }
-
-  // Second pass: rebuild the file line by line
+  // Rebuild the file line by line
   // Iterate through every line of clean code
   // i represents both position in original clean code and potential anchor target for comments.
   for (let i = 0; i < lines.length; i++) {
@@ -807,84 +783,28 @@ function injectComments(cleanText, comments, includePrivate = false) {
     // Handle the case of multiple comment blocks anchored to the same code line (stacked).
     if (blocks) {
       for (const block of blocks) {
-        const leadingBlanks = block.leadingBlankLines || 0;
-        const trailingBlanks = block.trailingBlankLines || 0;
+        // Determine which version to inject: text_cleanMode (if different) or block
+        const hasTextCleanMode = block.text_cleanMode && Array.isArray(block.text_cleanMode);
+        const cleanModeTexts = hasTextCleanMode ? block.text_cleanMode.map(b => b.text).join('\n') : '';
+        const blockTexts = block.block ? block.block.map(b => b.text).join('\n') : '';
+        const blocksIdentical = hasTextCleanMode && block.block && cleanModeTexts === blockTexts;
 
-        // Collect all consecutive blank lines before the anchor
-        const allBlankLines = [];
-        // i is the current anchor line index (code line we’re attaching comments to)
-        // We start scanning upward (j--) from that line.
-        for (let j = i - 1; j >= 0; j--) { 
-          if (!lines[j].trim()) { // if after removing whitespace theres no code, its a blank line
-            // unshift to iterate upward and add to front of array
-            // index 5 → code line
-            // index 4 → ""
-            // index 3 → ""
-            // index 2 → code
-            allBlankLines.unshift(lines[j]); 
-          } else {
-            break; // stops scanning once you hit non-blank code above.
-          }
-        }
-
-        // Split them: first N are leading, next M are trailing
-        // number of blank lines that belong to the comment (above the comment block).
-        const leadingBlankLines = allBlankLines.slice(0, leadingBlanks); 
-        // blank lines between comment and code anchor.
-        const trailingBlankLines = allBlankLines.slice(leadingBlanks, leadingBlanks + trailingBlanks);
-
-        // Add leading blanks
-        for (const blank of leadingBlankLines) {
-          result.push(blank);
-        }
-
-        // Combine text_cleanMode (if it's a block array) and block
-        let allBlockLines = [];
-
-        // text_cleanMode for blocks contains the block array
-        if (block.text_cleanMode && Array.isArray(block.text_cleanMode)) {
-          allBlockLines.push(...block.text_cleanMode);
-        }
-
-        // Add original block lines
-        if (block.block) {
-          allBlockLines.push(...block.block);
-        }
-
-        // If we have text_cleanMode, it already includes blank lines in the block array
-        // Don't add calculated leading/trailing blanks or we'll get duplicates
-        if (block.text_cleanMode && Array.isArray(block.text_cleanMode)) {
-          // Just push the merged block lines (blank lines already included)
-          for (const c of allBlockLines) {
-            result.push(c.text);
-          }
+        let linesToInject;
+        if (hasTextCleanMode && !blocksIdentical) {
+          // Use text_cleanMode (newly typed version)
+          linesToInject = block.text_cleanMode;
+        } else if (block.block) {
+          // Use block (VCM version or identical)
+          linesToInject = block.block;
         } else {
-          // No text_cleanMode - use the old logic with calculated leading/trailing blanks
-          // Split them: first N are leading, next M are trailing
-          const leadingBlankLines = allBlankLines.slice(0, leadingBlanks);
-          const trailingBlankLines = allBlankLines.slice(leadingBlanks, leadingBlanks + trailingBlanks);
+          linesToInject = [];
+        }
 
-          // Add leading blanks
-          for (const blank of leadingBlankLines) {
-            result.push(blank);
-          }
-
-          // Add block lines
-          for (const c of allBlockLines) {
-            result.push(c.text);
-          }
-
-          // Add trailing blanks
-          for (const blank of trailingBlankLines) {
-            result.push(blank);
-          }
+        // Inject all lines from the block (includes leading blanks, comments, and trailing blanks)
+        for (const lineObj of linesToInject) {
+          result.push(lineObj.text);
         }
       }
-    }
-
-    // Skip blank lines that are owned by comments (we already added them with the comment)
-    if (blankLinesOwnedByComments.has(i)) {
-      continue;
     }
 
     // STEP 2: Add the code line itself
@@ -898,13 +818,16 @@ function injectComments(cleanText, comments, includePrivate = false) {
       // Combine text_cleanMode (string) and text
       let commentText = "";
 
-      // text_cleanMode for inline comments is a string
-      if (inline.text_cleanMode && typeof inline.text_cleanMode === 'string') {
+      // Only use text_cleanMode if it's different from text (avoid double injection)
+      const hasTextCleanMode = inline.text_cleanMode && typeof inline.text_cleanMode === 'string';
+      const textsIdentical = hasTextCleanMode && inline.text === inline.text_cleanMode;
+
+      if (hasTextCleanMode && !textsIdentical) {
         commentText += inline.text_cleanMode;
       }
 
-      // Add original text
-      if (inline.text) {
+      // Add original text (only if no text_cleanMode or they're identical)
+      if (inline.text && (!hasTextCleanMode || textsIdentical)) {
         commentText += inline.text;
       }
 
@@ -927,7 +850,7 @@ function injectComments(cleanText, comments, includePrivate = false) {
 // 4. Handle strings properly - don't remove comment markers inside strings
 // 5. Language-aware: only remove markers appropriate for the file type
 // 6. Skip comments marked with alwaysShow flag (they appear in all modes)
-function stripComments(text, filePath, vcmComments = [], keepPrivate = false) {
+function stripComments(text, filePath, vcmComments = [], keepPrivate = false, isCleanMode = false) {
   // Get comment markers for this file type from our centralized config
   const commentMarkers = getCommentMarkersForFile(filePath);
 
@@ -1008,7 +931,8 @@ function stripComments(text, filePath, vcmComments = [], keepPrivate = false) {
   }
 
   // Extract current comments to identify blank lines within comment blocks
-  const currentComments = extractComments(text, filePath);
+  // Pass vcmComments and mode so blank line extraction works correctly
+  const currentComments = extractComments(text, filePath, vcmComments, isCleanMode);
 
   // Build sets for tracking lines
   const allCommentBlockLines = new Set();
@@ -1410,9 +1334,6 @@ async function activate(context) {
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
     const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
 
-    // Extract all current comments from the document
-    const currentComments = extractComments(text, doc.uri.path);
-
     // Load existing VCM data from both shared and private files
     const { sharedComments: existingComments, privateComments: existingPrivateComments } = await loadAllComments(relativePath);
 
@@ -1424,6 +1345,11 @@ async function activate(context) {
       isCommented = await detectInitialMode(doc, vcmDir);
       isCommentedMap.set(doc.uri.fsPath, isCommented);
     }
+
+    // Extract all current comments from the document
+    // Pass mode and existing comments so blank lines are handled correctly
+    const isCleanMode = !isCommented;
+    const currentComments = extractComments(text, doc.uri.path, existingComments, isCleanMode);
 
     // ------------------------------------------------------------------------
     // Merge Strategy
@@ -1545,18 +1471,9 @@ async function activate(context) {
         return current;
       });
 
-      // Add any existing comments that weren't matched
-      // (these are comments that were hidden/not extracted, like non-alwaysShow in clean mode)
-      for (const [key, candidates] of existingByKey) {
-        if (!currentByKey.has(key)) {
-          // This existing comment wasn't found in current - keep it if not already matched
-          for (const candidate of candidates) {
-            if (!matchedExisting.has(candidate)) {
-              finalComments.push(candidate);
-            }
-          }
-        }
-      }
+      // In commented mode, DO NOT add back unmatched existing comments
+      // If a comment isn't in the current document, it was deleted by the user
+      // (This is different from clean mode where hidden comments should be preserved)
 
     } else {
       // Clean mode:
@@ -1603,13 +1520,24 @@ async function activate(context) {
             const existing = candidates[0]; // Use first match (could improve with context matching)
 
             if (current.type === "inline") {
-              // For inline comments, just store the current text in text_cleanMode
-              // Since extractComments already combines all inline comments on the line,
-              // current.text contains the full accumulated text from the document
-              existing.text_cleanMode = current.text;
+              // For inline comments, only store if different from existing text
+              // If identical, set to null to avoid double injection
+              if (current.text !== existing.text) {
+                existing.text_cleanMode = current.text;
+              } else {
+                existing.text_cleanMode = null;
+              }
             } else if (current.type === "block") {
-              // For block comments, store the block array in text_cleanMode
-              existing.text_cleanMode = current.block;
+              // For block comments, compare only the text content (ignore line indices)
+              const existingTexts = existing.block?.map(b => b.text).join('\n') || '';
+              const currentTexts = current.block?.map(b => b.text).join('\n') || '';
+              const blocksIdentical = existingTexts === currentTexts;
+
+              if (!blocksIdentical) {
+                existing.text_cleanMode = current.block;
+              } else {
+                existing.text_cleanMode = null;
+              }
             }
           } else {
             // No existing comment - create new one with text_cleanMode
@@ -1689,6 +1617,44 @@ async function activate(context) {
     context.subscriptions.push(changeWatcher);
   }
 
+  // ---------------------------------------------------------------------------
+  // Helper: Generate commented version (for toggle and split view)
+  // ---------------------------------------------------------------------------
+  async function generateCommentedVersion(text, filePath, relativePath, includePrivate) {
+    const vcmFileUri = vscode.Uri.joinPath(vcmDir, relativePath + ".vcm.json");
+
+    try {
+      // Try to read existing .vcm file
+      const vcmData = JSON.parse((await vscode.workspace.fs.readFile(vcmFileUri)).toString());
+      const existingComments = vcmData.comments || [];
+
+      // Merge text_cleanMode into text/block (but don't modify the original)
+      const mergedComments = existingComments.map(comment => {
+        const merged = { ...comment };
+
+        if (comment.text_cleanMode) {
+          if (comment.type === "inline") {
+            // For inline: text_cleanMode is a string, prepend to text
+            merged.text = (comment.text_cleanMode || "") + (comment.text || "");
+          } else if (comment.type === "block") {
+            // For block: text_cleanMode is a block array, prepend to block
+            merged.block = [...(comment.text_cleanMode || []), ...(comment.block || [])];
+          }
+          merged.text_cleanMode = null;
+        }
+
+        return merged;
+      });
+
+      // Strip any comments typed in clean mode before injecting VCM comments
+      const cleanText = stripComments(text, filePath, mergedComments, false, true);
+      return injectComments(cleanText, mergedComments, includePrivate);
+    } catch {
+      // No .vcm file exists
+      return text;
+    }
+  }
+
   // Split view live sync: update the VCM split view when source file changes
   // This is separate from liveSync setting and always enabled when split view is open
   let splitViewUpdateTimeout;
@@ -1705,6 +1671,10 @@ async function activate(context) {
     const doc = e.document;
     const relativePath = vscode.workspace.asRelativePath(doc.uri);
 
+    // Check if this is an undo/redo operation
+    const isUndoRedo = e.reason === vscode.TextDocumentChangeReason.Undo ||
+                       e.reason === vscode.TextDocumentChangeReason.Redo;
+
     // Debounce updates to prevent multiple rapid injections during undo/redo
     clearTimeout(splitViewUpdateTimeout);
     splitViewUpdateTimeout = setTimeout(async () => {
@@ -1712,11 +1682,22 @@ async function activate(context) {
         // Get updated text from the document (source of truth)
         const text = doc.getText();
 
-        // Determine which version to show based on current mode
-        const isInCommentedMode = isCommentedMap.get(doc.uri.fsPath);
+        let actualMode;
+        const storedMode = isCommentedMap.get(doc.uri.fsPath);
+
+        // Only detect mode on undo/redo (might have changed modes)
+        // For normal edits, use stored mode (typing in clean mode stays in clean mode)
+        if (isUndoRedo) {
+          actualMode = await detectInitialMode(doc, vcmDir);
+          if (storedMode !== actualMode) {
+            isCommentedMap.set(doc.uri.fsPath, actualMode);
+          }
+        } else {
+          actualMode = storedMode;
+        }
 
         let showVersion;
-        if (isInCommentedMode) {
+        if (actualMode) {
           // Source is in commented mode, show clean in split view
           // Load VCM comments to preserve alwaysShow metadata
           const { allComments: vcmComments } = await loadAllComments(relativePath);
@@ -1724,26 +1705,9 @@ async function activate(context) {
           showVersion = stripComments(text, doc.uri.path, vcmComments, keepPrivate);
         } else {
           // Source is in clean mode, show commented in split view
-          // Only show comments that have been fully merged (not just text_cleanMode)
-          const { allComments: comments } = await loadAllComments(relativePath);
+          // Use the same logic as toggling to commented mode
           const includePrivate = privateCommentsVisible.get(doc.uri.fsPath) === true;
-
-          // Filter out comments that only have text_cleanMode (not yet merged into main text)
-          // These are newly typed comments that will be merged when toggling to commented mode
-          const mergedComments = comments.filter(c => {
-            if (c.type === "inline") {
-              return c.text != null; // Only include if text is set (not just text_cleanMode)
-            } else if (c.type === "block") {
-              return c.block != null; // Only include if block is set (not just text_cleanMode)
-            }
-            return true;
-          });
-
-          // Strip comments from clean text first (to remove comments typed in clean mode)
-          const cleanText = stripComments(text, doc.uri.path, mergedComments, false);
-
-          // Then inject only fully merged VCM comments
-          showVersion = injectComments(cleanText, mergedComments, includePrivate);
+          showVersion = await generateCommentedVersion(text, doc.uri.path, relativePath, includePrivate);
         }
 
         // Update the split view content
@@ -2939,64 +2903,116 @@ async function activate(context) {
       scrollListener = null;
     }
 
-    // Setup bidirectional click-to-jump (source → split view)
+    // Setup bidirectional click-to-jump (source ↔ split view)
     const sourceEditor = editor;
-    
+
     let activeHighlight;
+    let reverseActiveHighlight;
 
     scrollListener = vscode.window.onDidChangeTextEditorSelection(async e => {
       if (!vcmEditor) return;
-      if (e.textEditor !== sourceEditor) return;
 
       // Only jump on mouse clicks, not keyboard navigation or typing
       // e.kind will be undefined for typing, 1 for keyboard, 2 for mouse
       if (e.kind !== vscode.TextEditorSelectionChangeKind.Mouse) return;
 
-      const cursorPos = e.selections[0].active;
-      const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
-      if (!wordRange) return;
+      // Direction 1: Source → Split View
+      if (e.textEditor === sourceEditor) {
+        const cursorPos = e.selections[0].active;
+        const wordRange = sourceEditor.document.getWordRangeAtPosition(cursorPos);
+        if (!wordRange) return;
 
-      const word = sourceEditor.document.getText(wordRange);
-      if (!word || word.length < 2) return;
+        const word = sourceEditor.document.getText(wordRange);
+        if (!word || word.length < 2) return;
 
-      // Extract line context to improve matching accuracy
-      const sourceLine = sourceEditor.document.lineAt(cursorPos.line).text.trim();
-      const targetText = vcmEditor.document.getText();
-      const targetLines = targetText.split("\n");
+        // Extract line context to improve matching accuracy
+        const sourceLine = sourceEditor.document.lineAt(cursorPos.line).text.trim();
+        const targetText = vcmEditor.document.getText();
+        const targetLines = targetText.split("\n");
 
-      // Try to find the same line context first (exact match or partial)
-      let targetLine = targetLines.findIndex(line => line.trim() === sourceLine.trim());
-      if (targetLine === -1) {
-        // fallback: find first line containing the word as whole word
-        const wordRegex = new RegExp(`\\b${word}\\b`);
-        targetLine = targetLines.findIndex(line => wordRegex.test(line));
+        // Try to find the same line context first (exact match or partial)
+        let targetLine = targetLines.findIndex(line => line.trim() === sourceLine.trim());
+        if (targetLine === -1) {
+          // fallback: find first line containing the word as whole word
+          const wordRegex = new RegExp(`\\b${word}\\b`);
+          targetLine = targetLines.findIndex(line => wordRegex.test(line));
+        }
+
+        if (targetLine === -1) return;
+
+        // Jump + highlight that line
+        const targetPos = new vscode.Position(targetLine, 0);
+        vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
+        vcmEditor.revealRange(
+          new vscode.Range(targetPos, targetPos),
+          vscode.TextEditorRevealType.InCenter
+        );
+
+        // Remove previous highlight if exists
+        if (activeHighlight) {
+          activeHighlight.dispose();
+          activeHighlight = null;
+        }
+
+        // Create a highlight using the editor's built-in selection color
+        activeHighlight = vscode.window.createTextEditorDecorationType({
+          backgroundColor: new vscode.ThemeColor("editor.selectionBackground"),
+          isWholeLine: true,
+        });
+
+        vcmEditor.setDecorations(activeHighlight, [
+          new vscode.Range(targetPos, targetPos),
+        ]);
       }
 
-      if (targetLine === -1) return;
+      // Direction 2: Split View → Source
+      else if (e.textEditor === vcmEditor) {
+        const cursorPos = e.selections[0].active;
+        const wordRange = vcmEditor.document.getWordRangeAtPosition(cursorPos);
+        if (!wordRange) return;
 
-      // Jump + highlight that line
-      const targetPos = new vscode.Position(targetLine, 0);
-      vcmEditor.selection = new vscode.Selection(targetPos, targetPos);
-      vcmEditor.revealRange(
-        new vscode.Range(targetPos, targetPos),
-        vscode.TextEditorRevealType.InCenter
-      );
+        const word = vcmEditor.document.getText(wordRange);
+        if (!word || word.length < 2) return;
 
-      // Remove previous highlight if exists
-      if (activeHighlight) {
-        activeHighlight.dispose();
-        activeHighlight = null;
+        // Extract line context to improve matching accuracy
+        const splitLine = vcmEditor.document.lineAt(cursorPos.line).text.trim();
+        const sourceText = sourceEditor.document.getText();
+        const sourceLines = sourceText.split("\n");
+
+        // Try to find the same line context first (exact match or partial)
+        let sourceLine = sourceLines.findIndex(line => line.trim() === splitLine.trim());
+        if (sourceLine === -1) {
+          // fallback: find first line containing the word as whole word
+          const wordRegex = new RegExp(`\\b${word}\\b`);
+          sourceLine = sourceLines.findIndex(line => wordRegex.test(line));
+        }
+
+        if (sourceLine === -1) return;
+
+        // Jump + highlight that line
+        const sourcePos = new vscode.Position(sourceLine, 0);
+        sourceEditor.selection = new vscode.Selection(sourcePos, sourcePos);
+        sourceEditor.revealRange(
+          new vscode.Range(sourcePos, sourcePos),
+          vscode.TextEditorRevealType.InCenter
+        );
+
+        // Remove previous highlight if exists
+        if (reverseActiveHighlight) {
+          reverseActiveHighlight.dispose();
+          reverseActiveHighlight = null;
+        }
+
+        // Create a highlight using the editor's built-in selection color
+        reverseActiveHighlight = vscode.window.createTextEditorDecorationType({
+          backgroundColor: new vscode.ThemeColor("editor.selectionBackground"),
+          isWholeLine: true,
+        });
+
+        sourceEditor.setDecorations(reverseActiveHighlight, [
+          new vscode.Range(sourcePos, sourcePos),
+        ]);
       }
-
-      // Create a highlight using the editor’s built-in selection color
-      activeHighlight = vscode.window.createTextEditorDecorationType({
-        backgroundColor: new vscode.ThemeColor("editor.selectionBackground"),
-        isWholeLine: true,
-      });
-
-      vcmEditor.setDecorations(activeHighlight, [
-        new vscode.Range(targetPos, targetPos),
-      ]);
     });
     context.subscriptions.push(scrollListener);
 
