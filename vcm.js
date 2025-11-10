@@ -338,13 +338,6 @@ function extractComments(text, filePath, existingVCMComments = null, isCleanMode
   // Get comment markers for this file type from our centralized config list
   const commentMarkers = getCommentMarkersForFile(filePath);
 
-  // In clean mode, create a helper to check if a code line has VCM comments attached
-  const codeLineHasVCMComments = (lineIndex) => {
-    if (!isCleanMode || !existingVCMComments) return false;
-    const lineHash = hashLine(lines[lineIndex], 0);
-    return existingVCMComments.some(c => c.anchor === lineHash);
-  };
-
   // Build regex pattern for this file type
   // .replace() escapes special regex characters like *, ?, (, ), etc., because // or % would otherwise break the regex engine.
   // .join('|') means “match any of these markers.”
@@ -402,41 +395,15 @@ function extractComments(text, filePath, existingVCMComments = null, isCleanMode
 
     // CASE 1.5: Currently on Blank line - check if it's within a comment block
     if (!trimmed) { // if no (trimmed) lines
-      // If we have comments buffered (grouped), include blank lines as part of the block
+      // If we have comments buffered, this blank line is part of the comment block
+      // Include it so spacing is preserved exactly as typed
       if (commentBuffer.length > 0) {
-        let nextNonBlankIdx = -1; // initializes a "not-found" value.
-        // Look ahead to find the next non-blank line
-        for (let j = i + 1; j < lines.length; j++) {
-          if (lines[j].trim()) {
-            nextNonBlankIdx = j;
-            break;
-          }
-        }
-
-        // Include blank line if:
-        // 1. Next non-blank line is a comment (blank between comments), OR
-        // 2. In clean mode: next line is code that has VCM comments (blank would be between hidden comments)
-        if (nextNonBlankIdx >= 0 && isComment(lines[nextNonBlankIdx])) {
-          // Blank line between comment lines
-          commentBuffer.push({
-            text: line,           // Empty or whitespace-only line
-            originalLineIndex: i,      // 0-based line index
-          });
-          continue;
-        } else if (nextNonBlankIdx >= 0 && isCleanMode) {
-          // Next line is code, and we're in clean mode
-          // Only include blank if next code line has VCM comments attached
-          // (means blank is between this comment and a hidden VCM comment)
-          if (codeLineHasVCMComments(nextNonBlankIdx)) {
-            commentBuffer.push({
-              text: line,
-              originalLineIndex: i,
-            });
-          }
-          continue;
-        }
+        commentBuffer.push({
+          text: line,           // Empty or whitespace-only line
+          originalLineIndex: i, // 0-based line index
+        });
       }
-      // Otherwise, skip this blank line (it's between blocks or before any comment)
+      // Skip blank lines that are before any comments (they're just file spacing)
       continue;
     }
 
