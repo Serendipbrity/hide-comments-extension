@@ -1528,6 +1528,24 @@ async function activate(context) {
     }
 
     // ------------------------------------------------------------------------
+    // Filter out empty comments (no text, block, or text_cleanMode content)
+    // ------------------------------------------------------------------------
+    finalComments = finalComments.filter(comment => {
+      // For inline comments: must have text or text_cleanMode
+      if (comment.type === 'inline') {
+        return (comment.text && comment.text.trim()) ||
+               (comment.text_cleanMode && comment.text_cleanMode.trim());
+      }
+      // For block comments: must have block or text_cleanMode with content
+      else if (comment.type === 'block') {
+        const hasBlock = comment.block && Array.isArray(comment.block) && comment.block.length > 0;
+        const hasTextCleanMode = comment.text_cleanMode && Array.isArray(comment.text_cleanMode) && comment.text_cleanMode.length > 0;
+        return hasBlock || hasTextCleanMode;
+      }
+      return true;
+    });
+
+    // ------------------------------------------------------------------------
     // Save final comments, splitting into shared and private files
     // ------------------------------------------------------------------------
     // Add private comments that aren't already in finalComments
