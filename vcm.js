@@ -1437,109 +1437,76 @@ async function activate(context) {
 
       if (isPrivateMode) {
         // ====================================================================
-        // PRIVATE MODE IN CLEAN: Update anchors and content directly
+        // PRIVATE MODE IN CLEAN: Update anchors by matching text (like shared)
         // ====================================================================
 
-        // Track which current comments have been matched to avoid duplicates
-        const matchedCurrentIndices = new Set();
-
-        for (const existingComment of existingComments) {
-          const existingKey = `${existingComment.type}:${existingComment.anchor}:${existingComment.prevHash || 'null'}:${existingComment.nextHash || 'null'}`;
-          const existingText = existingComment.text || (existingComment.block ? existingComment.block.map(b => b.text).join('\n') : '');
-
-          // Try multiple matching strategies in order of specificity
-          let matchingCurrent = null;
-          let matchIndex = -1;
-
-          // Strategy 1: Exact match (anchor + prevHash + nextHash)
-          matchIndex = currentComments.findIndex((c, idx) => {
-            if (matchedCurrentIndices.has(idx)) return false;
-            const currentKey = `${c.type}:${c.anchor}:${c.prevHash || 'null'}:${c.nextHash || 'null'}`;
-            return c.type === existingComment.type && currentKey === existingKey;
-          });
-          if (matchIndex >= 0) {
-            matchingCurrent = currentComments[matchIndex];
-          }
-
-          // Strategy 2: Anchor + nextHash match (code added above, prevHash changed)
-          if (!matchingCurrent) {
-            matchIndex = currentComments.findIndex((c, idx) => {
-              if (matchedCurrentIndices.has(idx)) return false;
-              return c.type === existingComment.type &&
-                     c.anchor === existingComment.anchor &&
-                     (c.nextHash || 'null') === (existingComment.nextHash || 'null');
-            });
-            if (matchIndex >= 0) {
-              matchingCurrent = currentComments[matchIndex];
-            }
-          }
-
-          // Strategy 3: Anchor + prevHash match (code added below, nextHash changed)
-          if (!matchingCurrent) {
-            matchIndex = currentComments.findIndex((c, idx) => {
-              if (matchedCurrentIndices.has(idx)) return false;
-              return c.type === existingComment.type &&
-                     c.anchor === existingComment.anchor &&
-                     (c.prevHash || 'null') === (existingComment.prevHash || 'null');
-            });
-            if (matchIndex >= 0) {
-              matchingCurrent = currentComments[matchIndex];
-            }
-          }
-
-          // Strategy 4: Anchor-only match (context changed on both sides)
-          if (!matchingCurrent) {
-            matchIndex = currentComments.findIndex((c, idx) => {
-              if (matchedCurrentIndices.has(idx)) return false;
-              return c.type === existingComment.type &&
-                     c.anchor === existingComment.anchor;
-            });
-            if (matchIndex >= 0) {
-              matchingCurrent = currentComments[matchIndex];
-            }
-          }
-
-          // Strategy 5: Text match (anchor completely changed, use text as fallback)
-          if (!matchingCurrent && existingText) {
-            matchIndex = currentComments.findIndex((c, idx) => {
-              if (matchedCurrentIndices.has(idx)) return false;
-              const currentText = c.text || (c.block ? c.block.map(b => b.text).join('\n') : '');
-              return c.type === existingComment.type && currentText === existingText;
-            });
-            if (matchIndex >= 0) {
-              matchingCurrent = currentComments[matchIndex];
-            }
-          }
-
-          if (matchingCurrent) {
-            // Mark this current comment as matched
-            matchedCurrentIndices.add(matchIndex);
-
-            // Update anchor and context
-            existingComment.anchor = matchingCurrent.anchor;
-            existingComment.prevHash = matchingCurrent.prevHash;
-            existingComment.nextHash = matchingCurrent.nextHash;
-
-            // Update originalLineIndex
-            if (matchingCurrent.originalLineIndex !== undefined) {
-              existingComment.originalLineIndex = matchingCurrent.originalLineIndex;
-            }
-
-            // Update content (user may have edited the comment)
-            if (matchingCurrent.text !== undefined) {
-              existingComment.text = matchingCurrent.text;
-            }
-            if (matchingCurrent.block !== undefined) {
-              existingComment.block = matchingCurrent.block;
-            }
-
-            // Update anchorText if debugAnchorText is enabled
-            if (matchingCurrent.anchorText !== undefined) {
-              existingComment.anchorText = matchingCurrent.anchorText;
-            }
+        // Build map by text for matching
+        const existingByText = new Map();
+        for (const existing of existingComments) {
+          const textKey = existing.text || (existing.block ? existing.block.map(b => b.text).join('\n') : '');
+          if (textKey && !existingByText.has(textKey)) {
+            existingByText.set(textKey, existing);
           }
         }
 
+        // Track which existing comments we've matched
+        const matchedExisting = new Set();
+
+        // Process current comments
+        for (const current of currentComments) {
+          const key = `${current.type}:${current.anchor}:${current.prevHash || 'null'}:${current.nextHash || 'null'}`;
+          const currentText = current.text || (current.block ? current.block.map(b => b.text).join('\n') : '');
+
+          // Skip if this comment belongs to the "other" VCM (shared)
+          if (otherKeys.has(key)) {
+            continue;
+          }
+
+          // Match by text first (handles when comment moves)
+          let existing = null;
+          if (currentText && existingByText.has(currentText)) {
+            const candidate = existingByText.get(currentText);
+            if (!matchedExisting.has(candidate)) {
+              existing = candidate;
+              matchedExisting.add(existing);
+              // Update anchor to new position
+              existing.anchor = current.anchor;
+              existing.prevHash = current.prevHash;
+              existing.nextHash = current.nextHash;
+              existing.originalLineIndex = current.originalLineIndex;
+              // Update content
+              existing.text = current.text;
+              existing.block = current.block;
+              // Update anchorText
+              if (current.anchorText !== undefined) {
+                existing.anchorText = current.anchorText;
+              }
+            }
+          }
+
+          // If no text match, try anchor match
+          if (!existing) {
+            const candidates = existingByKey.get(key) || [];
+            if (candidates.length > 0 && !matchedExisting.has(candidates[0])) {
+              existing = candidates[0];
+              matchedExisting.add(existing);
+              // Update content
+              existing.text = current.text;
+              existing.block = current.block;
+              if (current.anchorText !== undefined) {
+                existing.anchorText = current.anchorText;
+              }
+            }
+          }
+
+          // If still no match, add as new
+          if (!existing) {
+            existingComments.push(current);
+            matchedExisting.add(current);
+          }
+        }
+
+        // Return all existing comments (updated in place)
         finalComments = existingComments;
 
       } else {
@@ -1777,43 +1744,23 @@ async function activate(context) {
     // Save final comments, splitting into shared and private files
     // ------------------------------------------------------------------------
     // In commented mode: private comments are extracted and already in finalComments with isPrivate: true
-    // In clean mode: private comments were processed separately and updated in place
+    // In clean mode: private comments were processed separately and updated in place (text-based matching)
 
-    // Deduplicate private comments by anchor + context hashes (stable identifiers)
-    // This prevents duplicates when the same private comment appears multiple times
-    const seenPrivateKeys = new Set();
-    const deduplicatedPrivateComments = existingPrivateComments.filter(pc => {
-      // Use anchor + context hashes as the unique key
-      const key = `${pc.type}:${pc.anchor}:${pc.prevHash || 'null'}:${pc.nextHash || 'null'}`;
+    // Check which private comments are already in finalComments (using text+anchor+type as key)
+    // In commented mode: private comments were extracted and marked with isPrivate
+    // In clean mode: private comments were updated separately via text-based matching
+    const finalCommentsSet = new Set(finalComments.map(c => {
+      const text = c.text || (c.block ? c.block.map(b => b.text).join('\n') : '');
+      return `${c.type}:${c.anchor}:${text}`;
+    }));
 
-      // Skip if we've already seen this exact comment location
-      if (seenPrivateKeys.has(key)) {
-        return false;
-      }
-      seenPrivateKeys.add(key);
-      return true;
-    });
-
-    // In commented mode, check if private comments are already in finalComments (marked with isPrivate: true)
-    // In clean mode, private comments are separate and should all be included
-    const finalCommentsPrivateKeys = new Set();
-    if (isCommented) {
-      // Build a set of private comments that are already in finalComments
-      for (const c of finalComments) {
-        if (c.isPrivate) {
-          const key = `${c.type}:${c.anchor}:${c.prevHash || 'null'}:${c.nextHash || 'null'}`;
-          finalCommentsPrivateKeys.add(key);
-        }
-      }
-    }
-
-    // Only add private comments that aren't already in finalComments (avoids duplicates in commented mode)
-    const missingPrivateComments = deduplicatedPrivateComments
-      .filter(pc => {
-        const key = `${pc.type}:${pc.anchor}:${pc.prevHash || 'null'}:${pc.nextHash || 'null'}`;
-        return !finalCommentsPrivateKeys.has(key);
-      })
-      .map(pc => ({ ...pc, isPrivate: true })); // Ensure isPrivate flag is set
+    // Add private comments that aren't already in finalComments
+    // (They might already be there if private comments were visible and got extracted)
+    const missingPrivateComments = existingPrivateComments.filter(pc => {
+      const text = pc.text || (pc.block ? pc.block.map(b => b.text).join('\n') : '');
+      const key = `${pc.type}:${pc.anchor}:${text}`;
+      return !finalCommentsSet.has(key);
+    }).map(pc => ({ ...pc, isPrivate: true })); // Ensure isPrivate flag is set
 
     const finalCommentsWithPrivate = [...finalComments, ...missingPrivateComments];
     await saveCommentsToVCM(relativePath, finalCommentsWithPrivate);
