@@ -215,8 +215,7 @@ class VCMContentProvider {
 function hashLine(line, lineIndex) {
   return crypto.createHash("md5")
   .update(line.trim())  // Hash content and removes spaces at both ends so formatting changes don’t alter the hash.
-  .digest("hex"); // Full 32-char MD5 for zero collision probability
-  // Ex: "x = 5" -> "a3f2b1c4"
+  .digest("hex") // Finalizes the hash and converts it to a hexadecimal string.
 }
 
 // Detect initial state: are comments visible or hidden?
@@ -2941,7 +2940,36 @@ async function activate(context) {
             let line = lines[i];
 
             // Check if this line has a private inline comment to remove
-            const inlineToRemove = privateInlinesToRemove.find(c => c.originalLineIndex === i);
+            // Match by context (prevHash + nextHash), not by originalLineIndex which can shift
+            const inlineToRemove = privateInlinesToRemove.find(c => {
+              // Find the actual line this comment should be on using its anchor
+              const codeOnly = line.split(/\s+\/\/|\s+#/).slice(0, 1)[0].trimEnd();
+              const lineHash = hashLine(codeOnly, 0);
+              
+              if (lineHash !== c.anchor) return false;
+              
+              // Verify context matches
+              let prevIdx = -1;
+              for (let j = i - 1; j >= 0; j--) {
+                if (lines[j].trim()) {
+                  prevIdx = j;
+                  break;
+                }
+              }
+              let nextIdx = -1;
+              for (let j = i + 1; j < lines.length; j++) {
+                if (lines[j].trim()) {
+                  nextIdx = j;
+                  break;
+                }
+              }
+              
+              const actualPrevHash = prevIdx >= 0 ? hashLine(lines[prevIdx], 0) : null;
+              const actualNextHash = nextIdx >= 0 ? hashLine(lines[nextIdx], 0) : null;
+              
+              return actualPrevHash === c.prevHash && actualNextHash === c.nextHash;
+            });
+            
             if (inlineToRemove) {
               // Remove the inline comment using the same logic as stripComments
               const commentMarkers = getCommentMarkersForFile(doc.uri.path);
